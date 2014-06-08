@@ -9,54 +9,51 @@ from Queue import Empty
 
 HOST = '127.0.0.1'
 PORT = 50009
+RECV_SIZE = 1024
+COND_WAIT = 9999
 
 class Listener:
     """ listen through a socket """
     def __init__(self, host=HOST, port=PORT):
-        stdout.write('-- start talk.Listener %s : %s --\n' % (host, port))
-        # prepare socket
+        """ prepare """
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.socket.bind((host, port))
-        # start a dequeue process
         self.queue = Queue()
         self.condition = Condition()
+
+    def listen(self, host=HOST, port=PORT):
+        """  listen the self.socket continuously """
+        stdout.write('-- listen start --\n')
+        # start a dequeue process
         self.dequeue_process = Process(target=self._dequeue, args=(self.queue, self.condition))
         self.dequeue_process.start()
-
-        # listen the self.socket continuously
-        while True:
+        # listen continuously
+        self.socket.bind((host, port))
+        stdout.write('talk: listen @ %s : %s --\n' % (host, port))
+        while self.socket:
             self.socket.listen(1)
             try:
                 conn, addr = self.socket.accept()
                 # wait to be connected
                 stdout.write('talk: connected by %s: %d\n' % addr)
             except KeyboardInterrupt:
-                self.dequeue_process.terminate()
                 break
-
             # enqueue on a thread
             enqueue_thread = Thread(target=self._enqueue, args=(conn, addr))
             enqueue_thread.setDaemon(True)
             enqueue_thread.start()
-
-        stdout.write('-- end talk.Listener --\n')
+        # terminate & end
+        self.queue.close()
+        self.socket.close()
+        self.dequeue_process.terminate()
+        stdout.write('-- listen end --\n')
 
     def _enqueue(self, conn, addr):
-        """ enqueue to the self.deque """
+        """ enqueue to the self.queue """
         message_list = []
-
         # receive a message
-        while True:
-            message = conn.recv(1024)
-            # wait for message
-            if not message:
-                break
-            message_list.append(message)
+        message = conn.recv(RECV_SIZE)
+        stdout.write('talk: enqueue "%s"\n' % message)
         conn.close()
-
-        message = ''.join(message_list)
-        stdout.write('talk: %s\n' % message)
-
         # enqueue
         with self.condition:
             self.queue.put(message)
@@ -65,25 +62,23 @@ class Listener:
     def _dequeue(self, queue, condition):
         """ dequeue from the self.deque """
         stdout.write('talk: start a dequeue process\n')
-        self.queue = queue
-        self.condition = condition
-
-        while True:
-            with self.condition:
+        # dequeu continuously
+        while queue:
+            with condition:
                 try:
-                    # dequeue
-                    message = self.queue.get(timeout=0.1)
+                    message = queue.get(timeout=0.1)
+                    stdout.write('talk: dequeue "%s"\n' % message)
                     self.react(message)
                 except Empty:
-                    self.condition.wait(99999)
+                    condition.wait(COND_WAIT)
                     # wait to be enqueued
 
     def react(self, message):
-        """ react by a message"""
-        print message
+        """ react by a message """
+        pass
 
 def speak(message, host=HOST, port=PORT):
-    """ speak through a socket"""
+    """ speak through a socket """
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.connect((host, port))
     sock.send(message)
@@ -91,3 +86,4 @@ def speak(message, host=HOST, port=PORT):
 
 if __name__ == "__main__":
     L = Listener()
+    L.listen()
