@@ -4,9 +4,11 @@
 import os
 import sys
 import socket
-from threading import Thread
-from multiprocessing import Process, Queue, Condition
-from Queue import Empty
+from threading import Thread, Condition
+from Queue import Queue, Empty
+
+from daemon import DaemonContext
+from lockfile.pidlockfile import PIDLockFile
 
 HOST = '127.0.0.1'
 PORT = 50009
@@ -21,28 +23,43 @@ class Listener:
         """ prepare """
         self.host = host
         self.port = port
-        self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.socket.settimeout(SOCK_WAIT)
-        self.queue = Queue()
-        self.condition = Condition()
+
+    def daemonize(self, filename='/var/run/talk.pid'):
+        """ deamone process """
+        fileout = open('talk.log', 'w+')
+        filelock = PIDLockFile(filename)
+        # check lockfile
+        if filelock.is_locked():
+            message = '%s already exists, exitting\n' % filelock.lock_file
+            sys.exit(message)
+
+        context = DaemonContext(pidfile=filelock,
+                                stdout=fileout, stderr=fileout)
+        with context:
+            self.listen()
 
     def listen(self):
         """  listen the self.socket continuously """
         sys.stdout.write('-- listen start --\n')
+        self.queue = Queue()
+        self.condition = Condition()
         # start a dequeue process and wait start
         with self.condition:
-            self.dequeue_process = Process(target=self._dequeue, args=(self.queue, self.condition))
-            self.dequeue_process.start()
-            self.condition.wait(COND_WAIT)
+            self.dequeue_thread = Thread(target=self._dequeue)
+            self.dequeue_thread.setDaemon(True)
+            self.dequeue_thread.start()
+            self.condition.wait()
         # socket bind
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.socket.settimeout(SOCK_WAIT) 
         try:
             self.socket.bind((self.host, self.port))
         except socket.error:
-            sys.stdout.write('talk: address %s:%s already in use\n' % (self.host, self.port))
+            sys.stdout.write('talk: socket error\n')
             sys.exit()
         sys.stdout.write('talk: listen @ %s:%s\n' % (self.host, self.port))
         # listen continuously
-        while self.dequeue_process.is_alive():
+        while self.dequeue_thread.is_alive():
             self.socket.listen(1)
             try:
                 conn, addr = self.socket.accept()
@@ -59,9 +76,7 @@ class Listener:
         else:
             sys.stdout.write('talk: dequeue process is dead\n')
         # end
-        self.queue.close()
         self.socket.close()
-        self.dequeue_process.terminate()
         sys.stdout.write('-- listen end --\n')
 
     def _enqueue(self, conn, addr):
@@ -76,24 +91,23 @@ class Listener:
             self.queue.put(message)
             self.condition.notify()
 
-    def _dequeue(self, queue, condition):
-        """ dequeue from the self.deque """
+    def _dequeue(self):
+        """ dequeue from the self.queue """
         sys.stdout.write('talk: start a dequeue process\n')
         # notify that this process start
-        with condition:
-            condition.notify()
+        with self.condition:
+            self.condition.notify()
         # dequeu continuously
         while True:
-            with condition:
+            with self.condition:
                 try:
-                    message = queue.get(timeout=QUEUE_WAIT)
+                    message = self.queue.get(timeout=QUEUE_WAIT)
                     sys.stdout.write('talk: dequeue "%s"\n' % message)
                     self._react(message)
                 except Empty:
                     try:
-                        condition.wait(COND_WAIT)
+                        self.condition.wait(COND_WAIT)
                         # wait to be enqueued
-                        sys.stdout.write('talk: wait\n')
                     except:
                         break
 
@@ -110,4 +124,4 @@ def speak(message, host=HOST, port=PORT):
 
 if __name__ == "__main__":
     L = Listener()
-    L.listen()
+    L.daemonize()
