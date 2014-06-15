@@ -94,4 +94,4 @@ if __name__ == "__main__":
         else:
             opt_addr = odd_arg_list[0]
         message_list = odd_arg_list[1:]
-        talk.speak(message_list, addr=opt_addr)
+        speak(message_list, addr=opt_addr)
