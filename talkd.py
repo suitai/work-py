@@ -8,17 +8,15 @@ from signal import SIGTERM
 from daemon import DaemonContext
 from lockfile.pidlockfile import PIDLockFile
 
-import talk
-from talk import Listener
+from talk import Listener, speak, SELF_ADDR
 
-SELF_HOST = '127.0.0.1:50010'
 PID_FILE = '/var/run/talk.pid'
 LOG_FILE = 'talk.log'
 
-class ListenerDaemon(Listener):
+class Listend(Listener):
     """ listen through a socket.socket """
-    def __init__(self, more_host=None, pidfile=PID_FILE, logfile=LOG_FILE):
-        Listener.__init__(self, more_host)
+    def __init__(self, more_addr=None, pidfile=PID_FILE, logfile=LOG_FILE):
+        Listener.__init__(self, more_addr)
         self.pidfile = pidfile
         self.logfile = logfile
 
@@ -34,8 +32,8 @@ class ListenerDaemon(Listener):
             sys.exit('%s already exists, exitting' % filelock.lock_file)
         # daemonize
         context = DaemonContext(pidfile=filelock, stdout=fileout, stderr=fileout)
-        for host in self.host_list:
-            sys.stdout.write('talk listen start @ %s \n' % host)    
+        for addr in self.addr_list:
+            sys.stdout.write('talk listen start @ %s \n' % addr)    
         with context:
             self.main()
 
@@ -58,7 +56,7 @@ def usage():
 
 if __name__ == "__main__":
     """ command execution """
-    opt_host = None
+    opt_addr = None
     try:
         action = sys.argv[1]
     except IndexError:
@@ -75,13 +73,10 @@ if __name__ == "__main__":
             usage()
             sys.exit()
         if opt == '--add':
-            opt_host = arg
+            opt_addr = arg
     # listen
     if action == 'listen':
-        if opt_host:
-            l = ListenerDaemon(more_host=opt_host)
-        else:
-            l = ListenerDaemon()
+        l = Listend(more_addr=opt_addr)
         if len(odd_arg_list) > 0:
             # kill the listen daemon
             if odd_arg_list[0] == 'kill':
@@ -95,8 +90,8 @@ if __name__ == "__main__":
     # speak
     elif action == 'speak':
         if odd_arg_list[0] == 'self':
-            opt_host = SELF_HOST
+            opt_addr = SELF_ADDR
         else:
-            opt_host = odd_arg_list[0]
+            opt_addr = odd_arg_list[0]
         message_list = odd_arg_list[1:]
-        talk.speak(message_list, host=opt_host)
+        talk.speak(message_list, addr=opt_addr)
