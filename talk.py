@@ -80,7 +80,7 @@ class Listener:
                         self.queue_stop = True
                         self.queue_condition.notify()
                     for ident in self.data.data_dict:
-                        self.data.set_key(key='stop', value=True, ident=ident)
+                        self.data.set_value(key='stop', value=True, ident=ident)
 
     def _signal(self,signum, frame):
         """ for signal """
@@ -205,7 +205,7 @@ class ListenData():
         with self.data_condition:
             self.data_dict[str(ident)] = info
     
-    def set_key(self, key, value, ident=None):
+    def set_value(self, key, value, ident=None):
         if not ident:
             ident = currentThread().ident
         with self.data_condition:
