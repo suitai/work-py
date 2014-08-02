@@ -1,69 +1,60 @@
 #!/usr/bin/env python
-""" talk through a socket.socket """
+""" command of talk through a socket """
 
 import os
 import sys
-from getopt import getopt, GetoptError
+import logging
+from getopt import getopt,GetoptError
 from signal import SIGTERM
-from daemon import DaemonContext
-from lockfile.pidlockfile import PIDLockFile
-
-from talk import Listener, speak, SELF_ADDR
+try:
+    import psutil
+    from talk import Listener,speak,SELF_ADDR,LOG_FORMAT
+except ImportError, detail:
+    sys.exit('ImportError: %s' % detail) 
 
 PID_FILE = '/var/run/talk.pid'
-LOG_FILE = 'talk.log'
+LOG_FILE = './talk.log'
 
-class Listend(Listener):
-    """ listen through a socket.socket """
-    def __init__(self, more_addr=None, pidfile=PID_FILE, logfile=LOG_FILE):
-        Listener.__init__(self, more_addr)
-        self.pidfile = pidfile
-        self.logfile = logfile
+def check_pidfile(pidfile):
+    if os.path.exists(pidfile):
+        pidfile = open(pidfile, 'r')
+        return int(pidfile.read())
+    else:
+        sys.exit('Listener is not running') 
 
-    def daemonize(self):
-        """ deamone process """
-        try:
-            fileout = open(self.logfile, 'a')
-        except IOError, detail:
-            sys.exit('IOError: %s' % detail)
-        filelock = PIDLockFile(self.pidfile)
-        # check lockfile
-        if filelock.is_locked():
-            sys.exit('%s already exists, exitting' % filelock.lock_file)
-        # daemonize
-        context = DaemonContext(pidfile=filelock, stdout=fileout, stderr=fileout)
-        for addr in self.addr_list:
-            sys.stdout.write('talk listen start @ %s \n' % addr)    
-        with context:
-            self.main()
+def kill_process(pidfile):
+    """ kill the daemon process"""
+    # get pid
+    pid = check_pidfile(pidfile)
+    # kill
+    try:
+        os.kill(pid, SIGTERM)
+    except OSError, detail:
+        sys.exit('OSError: %s' % detail)
 
-    def kill(self):
-        """ kill the daemon process"""
-        # get pid
-        try:
-            pidfile = open(self.pidfile, 'r')
-        except IOError, detail:
-            sys.exit('IOError: %s' % detail)
-        pid = int(pidfile.read())
-        # kill
-        try:
-            os.kill(pid, SIGTERM)
-        except OSError, detail:
-            sys.exit('OSError: %s' % detail)
+def is_process(pidfile):
+    # get pid
+    pid = check_pidfile(pidfile)
+    # search pid
+    if pid in psutil.get_pid_list():
+        return True
+    else:
+        return False
 
 def usage():
-    print 'usage'
+    command = sys.argv[0]
+    sys.stdout.write('usage: %s listen [daemon|status|kill]\n' % command)    
+    sys.stdout.write('       %s speak <host> <message>\n' % command)    
+    sys.exit()
 
 if __name__ == "__main__":
     """ command execution """
-    opt_addr = None
-    try:
-        action = sys.argv[1]
-    except IndexError:
+    if not len(sys.argv) > 1:
         usage()
+    action = sys.argv[1]
     # handle options
     option = "h"
-    long_option = ["help", "add="] 
+    long_option = ["help",]
     try:
         opt_list, odd_arg_list = getopt(sys.argv[2:], option, long_option)
     except GetoptError, detail:
@@ -71,27 +62,43 @@ if __name__ == "__main__":
     for opt, arg in opt_list:
         if opt in ('-h', '--help'):
             usage()
-            sys.exit()
-        if opt == '--add':
-            opt_addr = arg
     # listen
     if action == 'listen':
-        l = Listend(more_addr=opt_addr)
         if len(odd_arg_list) > 0:
+            # state of the listen deamon
+            if odd_arg_list[0] == 'status':
+                status = is_process(PID_FILE)
+                if status:
+                    sys.stdout.write('Listener is running\n')
+                else:
+                    sys.exit('Listener is not running')
             # kill the listen daemon
-            if odd_arg_list[0] == 'kill':
-                l.kill()
-                sys.exit()
+            elif odd_arg_list[0] == 'kill':
+                kill_process(PID_FILE)
+                sys.stdout.write('Listener killed\n')
+            # start daemon
+            elif odd_arg_list[0] == 'daemon':
+                l = Listener(logfile=LOG_FILE)
+                l.daemonize(pidfile=PID_FILE)
+                sys.stdout.write('Listener start\n')
             # start listen
-            if odd_arg_list[0] == 'daemonize':
-                l.daemonize()
+            elif odd_arg_list[0] == 'start':
+                l = Listener()
+                l.start()
+            else:
+                usage()
         else:
-            l.main()
+            usage()
     # speak
     elif action == 'speak':
-        if odd_arg_list[0] == 'self':
-            opt_addr = SELF_ADDR
+        if len(odd_arg_list) > 0:
+            if odd_arg_list[0] == 'self':
+                opt_addr = SELF_ADDR
+            else:
+                opt_addr = odd_arg_list[0]
+            message_list = odd_arg_list[1:]
+            speak(message_list, addr=opt_addr)
         else:
-            opt_addr = odd_arg_list[0]
-        message_list = odd_arg_list[1:]
-        speak(message_list, addr=opt_addr)
+            usage()
+    else:
+        usage()
