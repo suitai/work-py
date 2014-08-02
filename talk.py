@@ -5,7 +5,6 @@ import sys
 import socket
 import signal
 import logging
-from time import sleep
 from Queue import Queue,Empty
 from threading import Thread,Condition,currentThread,active_count
 try:
@@ -18,11 +17,11 @@ LOG_FORMAT = "%(asctime)-15s %(levelname)s %(name)-8s %(message)s"
 SELF_HOST = '127.0.0.1'
 SELF_PORT = 50010
 SELF_ADDR = ('%s:%s' % (SELF_HOST,SELF_PORT))
-RECV_SIZE = 1024
+RECV_SIZE = 4096
 QUEUE_WAIT = 0.1
-SOCK_WAIT = 10
-COND_WAIT = 100
-THREAD_WAIT = 1000
+SOCK_WAIT = 5
+COND_WAIT = 10
+THREAD_WAIT = 100
 SOCK_BACKLOG = 1
 
 class Listener:
@@ -34,7 +33,7 @@ class Listener:
         self.queue_condition = Condition()
         self.data = ListenData()
         self.other_addr_list = []
-        self.other_manage_list = []
+        # make log
         self.logger = logging.getLogger('Listener')
         self.logger.setLevel(logging.INFO)
         self.handler = None
@@ -46,10 +45,9 @@ class Listener:
         else:
             logging.basicConfig(format=LOG_FORMAT)
 
-    def set_addr(self, addr, manage=None):
-        """ set an addr and a manage """
+    def add_addr(self, addr):
+        """ set an addr """
         self.other_addr_list.append(addr)
-        self.other_manage_list.append(manage)
 
     def daemonize(self, pidfile):
         """ deamone process """
@@ -65,21 +63,24 @@ class Listener:
     def start(self):
         """ start threads """
         _add_thread(self._dequeue)
-        _add_thread(self._listen, args=(SELF_ADDR, self.manage))
+        _add_thread(self._listen, args=(SELF_ADDR,))
         # start other listen thread
-        for addr, manage in zip(self.other_addr_list, self.other_manage_list):
-            _add_thread(self._listen, args=(addr, manage))
+        for addr in self.other_addr_list:
+            _add_thread(self._listen, args=(addr,))
         # wait thread
         signal.signal(signal.SIGINT, self._signal)
         signal.signal(signal.SIGTERM, self._signal)
  
-        while active_count() > 2:
+        while active_count() > 1:
             with self.condition:
-                self.is_alive = True
+                self.stop = False
                 self.condition.wait(THREAD_WAIT)
-                if not self.is_alive:
-                    self.logger.info('listen end')
-                    break
+                if self.stop:
+                    with self.queue_condition:
+                        self.queue_stop = True
+                        self.queue_condition.notify()
+                    for ident in self.data.data_dict:
+                        self.data.set_key(key='stop', value=True, ident=ident)
 
     def _signal(self,signum, frame):
         """ for signal """
@@ -87,43 +88,42 @@ class Listener:
                      2:"SIGINT", 11:"SIGSEGV", 15:"SIGTERM", 0:"SIG_DFL", 1:"SIG_IGN"}
         self.logger.info('received signal (%s)' % sig_names[signum])
         with self.condition:
-            self.is_alive = False
+            self.stop = True
             self.condition.notify()
 
-    def _listen(self, addr, manage=None):
+    def _listen(self, addr):
         """ start to listen the self.socket continuously """
         # add socket and info
         listen_socket = _add_socket(addr)
         if not listen_socket:
             self.logger.error('listen failed @ %s' % addr)
-            return
-        listen_info = {'thread':currentThread, 'addr':addr, 'socket':listen_socket, 'manage':manage}
-        self.data.set_info(listen_info)
-        # listen continuously
-        self.logger.info('listen start @ %s' % addr)
-        while True:
-            try:
-                listen_socket.listen(SOCK_BACKLOG)
-                conn, conn_addr = listen_socket.accept()
-                # wait to be connected
-                self.logger.info('%s is connected by %s:%d' % (addr,conn_addr[0],conn_addr[1]))
-            except socket.timeout:
-                continue
-            except socket.error, (errno, detail):
-                if not errno == 9:
-                    self.logger.error('socket.error "%s"' % detail)
-                break
-            # enqueue on another thread                       
-            enqueue_thread = _add_thread(self._enqueue, args=(conn,conn_addr,manage))
-        listen_socket.close()
-        self.data.del_info()
-        self.logger.info('listen end @ %s' % addr)
+        else:
+            listen_info = {'addr':addr, 'socket':listen_socket, 'stop':False}
+            self.data.set_info(listen_info)
+            # listen continuously
+            self.logger.info('listen start @ %s' % addr)
+            while not self.data.get_value('stop'):
+                try:
+                    listen_socket.listen(SOCK_BACKLOG)
+                    conn, conn_addr = listen_socket.accept()
+                    # wait to be connected
+                    self.logger.info('%s is connected by %s' % (addr,conn_addr[0]))
+                except socket.timeout:
+                    continue
+                except socket.error, (errno, detail):
+                    if not errno == 9:
+                        self.logger.error('socket.error "%s"' % detail)
+                    break
+                # enqueue on another thread 
+                enqueue_thread = _add_thread(self._enqueue, args=(conn,))
+            listen_socket.close()
+            self.data.del_info()
+            self.logger.info('listen end @ %s' % addr)
         with self.condition:
             self.condition.notify()
 
-    def _enqueue(self, conn, addr, manage):
+    def _enqueue(self, conn):
         """ enqueue to the self.queue """
-        is_enqueue = True
         # receive a message
         while True:
             try:
@@ -132,94 +132,105 @@ class Listener:
             except socket.error, detail:
                 self.logger.error('socket.error: %s' % detail)
                 continue
-        conn.close()
-        # manage before enqueue
-        if manage:
-            is_enqueue = manage(addr, message)
-        # enqueue
-        if is_enqueue:
-            queue_message = ('%s %s' % (addr[0],message))
+        # react a message
+        self.react(conn, message)
+        # enqueue a message
+        if message.split()[0] == 'enqueue':
+            queue_message = ' '.join(message.split()[1:])
             with self.queue_condition:
                 self.queue.put(queue_message)
                 self.queue_condition.notify()
-       
+        conn.close()
+        
+    def react(self, conn, message):
+        """ react for the message """
+        message_list = message.split()
+        message_len = len(message_list)
+        send_message = ''
+        if message_list[0] == 'socket':
+            if message_len > 1:
+                if message_list[1] == 'list':
+                    addr_list = []
+                    for ident in self.data.data_dict:
+                        ident = str(ident)
+                        addr_list.append(self.data.data_dict[ident]['addr'])
+                    send_message = ', '.join(addr_list)
+ 
+                if message_len > 2:
+                    if message_list[1] == 'add':
+                        _add_thread(self._listen, args=(message_list[2],))
+                        send_message = ('try to add socket %s' % message_list[2])
+                            
+                    elif message_list[1] == 'del':
+                        listen_info = self.data.search_info('addr', message_list[2])
+                        if listen_info:
+                            listen_info['socket'].close()
+                            self.logger.info('manage del socket %s' % message_list[2])
+                            send_message = ('del socket %s' % message_list[2])
+                        else:
+                            send_message = ('not found socket %s' % message_list[2])
+        conn.send(send_message)
+
     def _dequeue(self):
         """ dequeue from the self.queue """
+        self.queue_stop = False
         # dequeu continuously
-        while True:
+        while not self.queue_stop:
             with self.queue_condition:
                 try:
                     queue_message = self.queue.get(timeout=QUEUE_WAIT)
                     addr = queue_message.split()[0]
-                    message = ' '.join(queue_message.split()[1:])
-                    self.react(addr, message)
+                    message = ' '.join(queue_message.split()[0:])
+                    self.queue_act(message)
                 except Empty:
                     self.queue_condition.wait(COND_WAIT)
         with self.condition:
-            self.is_alive = False
+            self.stop = True
             self.condition.notify()
 
-    def manage(self, addr, message):
-        """ manage the Listener """
-        message_list = message.split()
-        message_len = len(message_list)
-        if addr[0] == SELF_HOST and message_list[0] == 'manage':
-            if message_len > 3:
-                if message_list[1] == 'add':
-                    if message_list[2] == 'socket':
-                        self.logger.info('manage add socket %s' % message_list[3])
-                        _add_thread(self._listen, args=(message_list[3],))
-                elif message_list[1] == 'del':
-                    if message_list[2] == 'socket':
-                        listen_info = self.data.search_info('addr', message_list[3])
-                        if listen_info:
-                            self.logger.info('manage del socket %s' % message_list[3])
-                            listen_info['socket'].close()
-            return False
-        return True
-
-    def react(self, addr, message):
+    def queue_act(self, message):
         """ react the message """
-        self.logger.info('react to message "%s" from %s' % (message, addr))
+        self.logger.info('queu_act to message "%s"' % message)
 
 class ListenData():
     """ info dictionary for listen """
     def __init__(self):
+        """ prepare """
         self.data_condition = Condition()
         self.data_dict = {}
 
-    def get_info(self, ident=None):
-        """ get listen info """
+    def set_info(self, info):
+        """ set listen info """
+        ident = currentThread().ident
+        with self.data_condition:
+            self.data_dict[str(ident)] = info
+    
+    def set_key(self, key, value, ident=None):
         if not ident:
             ident = currentThread().ident
-        ident = str(ident)
         with self.data_condition:
-            if self.datta_dict[ident]:
-                return self.data_dict[ident]
-        return None
+            self.data_dict[str(ident)][str(key)] = value
 
-    def set_info(self, info, ident=None):
+    def del_info(self):
+        """ del listen info """
+        ident = currentThread().ident
+        with self.data_condition:
+            del self.data_dict[str(ident)]
+
+    def get_value(self, key, ident=None):
         """ set listen info """
         if not ident:
             ident = currentThread().ident
         with self.data_condition:
-            self.data_dict[str(ident)] = info
-
-    def del_info(self, ident=None):
-        """ del listen info """
-        if not ident:    
-            ident = currentThread().ident
-        with self.data_condition:
-            del self.data_dict[str(ident)]
+            return self.data_dict[str(ident)][key]
         
     def search_info(self, key, value):
         """ search info return ident """
         key = str(key)
         with self.data_condition:
             for ident in self.data_dict:
-                ident = str(ident)
-                if self.data_dict[ident][key] == value:
-                    return self.data_dict[ident]
+                if self.data_dict[str(ident)][key] == value:
+                    return self.data_dict[str(ident)]
         return None
 
 def _add_thread(target, args=()):
@@ -266,6 +277,10 @@ def speak(message_list, addr=SELF_ADDR):
         speak_socket.send(message)
     except socket.error, detail:
         sys.exit('socket error: "%s"' % detail)
+    # accept message
+    message = speak_socket.recv(RECV_SIZE)
+    if message:    
+        sys.stdout.write('%s\n' % message)
 
 if __name__ == "__main__":
     pass
