@@ -8,7 +8,7 @@ from getopt import getopt,GetoptError
 from signal import SIGTERM
 try:
     import psutil
-    from talk import Listener,speak,SELF_ADDR,LOG_FORMAT
+    from talk import Listener,speak,LOG_FORMAT
 except ImportError, detail:
     sys.exit('ImportError: %s' % detail) 
 
@@ -43,7 +43,7 @@ def is_process(pidfile):
 
 def usage():
     command = sys.argv[0]
-    sys.stdout.write('usage: %s listen [daemon|status|kill]\n' % command)    
+    sys.stdout.write('usage: %s listen [status|run|daemon|kill]\n' % command)    
     sys.stdout.write('       %s speak <host> <message>\n' % command)    
     sys.exit()
 
@@ -78,11 +78,11 @@ if __name__ == "__main__":
                 sys.stdout.write('Listener killed\n')
             # start daemon
             elif odd_arg_list[0] == 'daemon':
-                l = Listener(logfile=LOG_FILE)
-                l.daemonize(pidfile=PID_FILE)
-                sys.stdout.write('Listener start\n')
+                l = Listener()
+                l.daemonize(pidfile=PID_FILE, logfile=LOG_FILE)
+                sys.stdout.write('Listener daemon start\n')
             # start listen
-            elif odd_arg_list[0] == 'start':
+            elif odd_arg_list[0] == 'run':
                 l = Listener()
                 l.start()
             else:
@@ -92,10 +92,7 @@ if __name__ == "__main__":
     # speak
     elif action == 'speak':
         if len(odd_arg_list) > 0:
-            if odd_arg_list[0] == 'self':
-                opt_addr = SELF_ADDR
-            else:
-                opt_addr = odd_arg_list[0]
+            opt_addr = odd_arg_list[0]
             message_list = odd_arg_list[1:]
             speak(message_list, addr=opt_addr)
         else:

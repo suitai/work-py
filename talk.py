@@ -14,47 +14,48 @@ except ImportError, detail:
     sys.exit('ImportError: %s' % detail)
 
 LOG_FORMAT = "%(asctime)-15s %(levelname)s %(name)-8s %(message)s"
-SELF_HOST = '127.0.0.1'
-SELF_PORT = 50010
-SELF_ADDR = ('%s:%s' % (SELF_HOST,SELF_PORT))
+LISTEN_PORT = 50010
 RECV_SIZE = 4096
 QUEUE_WAIT = 0.1
-SOCK_WAIT = 5
-COND_WAIT = 10
-THREAD_WAIT = 100
+SOCK_WAIT = 3
+COND_WAIT = 30
+THREAD_WAIT = 60
 SOCK_BACKLOG = 1
 
 class Listener:
     """ listen through a socket """
-    def __init__(self, logfile=None):
+    def __init__(self):
         """ prepare """
         self.condition = Condition()
         self.queue = Queue()
         self.queue_condition = Condition()
         self.data = ListenData()
-        self.other_addr_list = []
+        self.react = None
         # make log
         self.logger = logging.getLogger('Listener')
         self.logger.setLevel(logging.INFO)
         self.handler = None
-        if logfile:
-            self.handler = logging.FileHandler(logfile)
-            self.handler.level = logging.INFO
-            self.handler.formatter = logging.Formatter(fmt=LOG_FORMAT)
-            self.logger.addHandler(self.handler)
-        else:
-            logging.basicConfig(format=LOG_FORMAT)
+        # host
+        self.other_addr_list = []
+        host_addr = socket.gethostbyname(socket.gethostname())
+        if not host_addr == '127.0.0.1':
+            self.other_addr_list.append(host_addr)
 
     def add_addr(self, addr):
         """ set an addr """
         self.other_addr_list.append(addr)
 
-    def daemonize(self, pidfile):
+    def daemonize(self, pidfile, logfile):
         """ deamone process """
         # check lockfile
         filelock = PIDLockFile(pidfile)
         if filelock.is_locked():
             sys.exit('%s already exists, exitting' % filelock.lock_file)
+        # logfile
+        self.handler = logging.FileHandler(logfile)
+        self.handler.level = logging.INFO
+        self.handler.formatter = logging.Formatter(fmt=LOG_FORMAT)
+        self.logger.addHandler(self.handler)
         # daemonize
         context = DaemonContext(pidfile=filelock, files_preserve=[self.handler.stream])
         with context:
@@ -62,8 +63,10 @@ class Listener:
 
     def start(self):
         """ start threads """
+        if not self.handler:
+            logging.basicConfig(format=LOG_FORMAT)
         _add_thread(self._dequeue)
-        _add_thread(self._listen, args=(SELF_ADDR,))
+        _add_thread(self._listen, args=('127.0.0.1',))
         # start other listen thread
         for addr in self.other_addr_list:
             _add_thread(self._listen, args=(addr,))
@@ -94,14 +97,24 @@ class Listener:
     def _listen(self, addr):
         """ start to listen the self.socket continuously """
         # add socket and info
-        listen_socket = _add_socket(addr)
-        if not listen_socket:
+        host, port = _split_addr(addr)
+        if not port:
+            port = LISTEN_PORT
+        addr = ':'.join([host,str(port)])
+        # socket bind
+        listen_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listen_socket.settimeout(SOCK_WAIT)
+        try:
+            listen_socket.bind((host, int(port)))
+            self.logger.info('start @ %s' % addr)
+        except socket.error, detail:
+            listen_socket.close()
+            self.logger.error('socket error %s\n' % detail)
             self.logger.error('listen failed @ %s' % addr)
         else:
             listen_info = {'addr':addr, 'socket':listen_socket, 'stop':False}
             self.data.set_info(listen_info)
             # listen continuously
-            self.logger.info('listen start @ %s' % addr)
             while not self.data.get_value('stop'):
                 try:
                     listen_socket.listen(SOCK_BACKLOG)
@@ -119,8 +132,9 @@ class Listener:
             listen_socket.close()
             self.data.del_info()
             self.logger.info('listen end @ %s' % addr)
-        with self.condition:
-            self.condition.notify()
+        finally:
+            with self.condition:
+                self.condition.notify()
 
     def _enqueue(self, conn):
         """ enqueue to the self.queue """
@@ -131,9 +145,9 @@ class Listener:
                 break
             except socket.error, detail:
                 self.logger.error('socket.error: %s' % detail)
-                continue
+                continue    
         # react a message
-        self.react(conn, message)
+        self._react(conn, message)
         # enqueue a message
         if message.split()[0] == 'enqueue':
             queue_message = ' '.join(message.split()[1:])
@@ -142,7 +156,7 @@ class Listener:
                 self.queue_condition.notify()
         conn.close()
         
-    def react(self, conn, message):
+    def _react(self, conn, message):
         """ react for the message """
         message_list = message.split()
         message_len = len(message_list)
@@ -155,25 +169,15 @@ class Listener:
                         ident = str(ident)
                         addr_list.append(self.data.data_dict[ident]['addr'])
                     send_message = ', '.join(addr_list)
- 
-                if message_len > 2:
-                    if message_list[1] == 'add':
-                        _add_thread(self._listen, args=(message_list[2],))
-                        send_message = ('try to add socket %s' % message_list[2])
-                            
-                    elif message_list[1] == 'del':
-                        listen_info = self.data.search_info('addr', message_list[2])
-                        if listen_info:
-                            listen_info['socket'].close()
-                            self.logger.info('manage del socket %s' % message_list[2])
-                            send_message = ('del socket %s' % message_list[2])
-                        else:
-                            send_message = ('not found socket %s' % message_list[2])
+        else:
+            if self.react:
+                send_message = self.react(message)
         conn.send(send_message)
 
     def _dequeue(self):
         """ dequeue from the self.queue """
         self.queue_stop = False
+        self.logger.info('queue start')
         # dequeu continuously
         while not self.queue_stop:
             with self.queue_condition:
@@ -187,10 +191,11 @@ class Listener:
         with self.condition:
             self.stop = True
             self.condition.notify()
+        self.logger.info('queue end')
 
     def queue_act(self, message):
         """ react the message """
-        self.logger.info('queu_act to message "%s"' % message)
+        self.logger.info('queue_act to message "%s"' % message)
 
 class ListenData():
     """ info dictionary for listen """
@@ -240,21 +245,6 @@ def _add_thread(target, args=()):
     new_thread.start()
     return new_thread
 
-def _add_socket(addr):
-    """ add a socket from addr """
-    host, port = _split_addr(addr)
-    if not port:
-        port = SELF_PORT
-    # socket bind
-    target_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    target_socket.settimeout(SOCK_WAIT)
-    try:
-        target_socket.bind((host, int(port)))
-    except socket.error, detail:
-        sys.stderr.write('socket error %s\n' % detail)
-        return None
-    return target_socket
-
 def _split_addr(addr):
     """ get host and port from addr """
     port = None
@@ -264,23 +254,25 @@ def _split_addr(addr):
         port = int(split_addr[1])
     return host, port
 
-def speak(message_list, addr=SELF_ADDR):
+def speak(message_list, addr='127.0.0.1'):
     """ speak through a socket """
     # send message
     host, port = _split_addr(addr)
     if not port:
-        port = SELF_PORT
+        port = LISTEN_PORT
     message = ' '.join(message_list)
     speak_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
         speak_socket.connect((host, port))
         speak_socket.send(message)
     except socket.error, detail:
+        speak_socket.close()
         sys.exit('socket error: "%s"' % detail)
-    # accept message
-    message = speak_socket.recv(RECV_SIZE)
-    if message:    
-        sys.stdout.write('%s\n' % message)
+    else:
+        # accept message
+        message = speak_socket.recv(RECV_SIZE)
+        if message:    
+            sys.stdout.write('%s\n' % message)
 
 if __name__ == "__main__":
     pass
