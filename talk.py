@@ -13,14 +13,8 @@ try:
 except ImportError, detail:
     sys.exit('ImportError: %s' % detail)
 
-LOG_FORMAT = "%(asctime)-15s %(levelname)s %(name)-8s %(message)s"
+LOG_FORMAT = "%(asctime)-15s %(levelname)s %(message)s"
 LISTEN_PORT = 50010
-RECV_SIZE = 4096
-QUEUE_WAIT = 0.1
-SOCK_WAIT = 3
-COND_WAIT = 30
-THREAD_WAIT = 60
-SOCK_BACKLOG = 1
 
 class Listener:
     """ listen through a socket """
@@ -29,21 +23,21 @@ class Listener:
         self.condition = Condition()
         self.queue = Queue()
         self.queue_condition = Condition()
-        self.data = ListenData()
-        self.react = None
+        self.data = DictData()
+        self.stop = False
+        self.is_daemon = False
         # make log
-        self.logger = logging.getLogger('Listener')
+        self.logger = logging.getLogger()
         self.logger.setLevel(logging.INFO)
-        self.handler = None
         # host
-        self.other_addr_list = []
+        self.addr_list = ['127.0.0.1']
         host_addr = socket.gethostbyname(socket.gethostname())
         if not host_addr == '127.0.0.1':
-            self.other_addr_list.append(host_addr)
+            self.addr_list.append(host_addr)
 
     def add_addr(self, addr):
         """ set an addr """
-        self.other_addr_list.append(addr)
+        self.addr_list.append(addr)
 
     def daemonize(self, pidfile, logfile):
         """ deamone process """
@@ -52,38 +46,39 @@ class Listener:
         if filelock.is_locked():
             sys.exit('%s already exists, exitting' % filelock.lock_file)
         # logfile
-        self.handler = logging.FileHandler(logfile)
-        self.handler.level = logging.INFO
-        self.handler.formatter = logging.Formatter(fmt=LOG_FORMAT)
-        self.logger.addHandler(self.handler)
+        handler = logging.FileHandler(logfile)
+        handler.level = logging.INFO
+        handler.formatter = logging.Formatter(fmt=LOG_FORMAT)
+        self.logger.addHandler(handler)
         # daemonize
-        context = DaemonContext(pidfile=filelock, files_preserve=[self.handler.stream])
+        self.is_daemon = True
+        context = DaemonContext(pidfile=filelock, files_preserve=[handler.stream])
         with context:
             self.start()
 
     def start(self):
         """ start threads """
-        if not self.handler:
+        if not self.is_daemon:
             logging.basicConfig(format=LOG_FORMAT)
+        del self.is_daemon
         _add_thread(self._dequeue)
-        _add_thread(self._listen, args=('127.0.0.1',))
         # start other listen thread
-        for addr in self.other_addr_list:
+        for addr in self.addr_list:
             _add_thread(self._listen, args=(addr,))
-        # wait thread
+        del self.addr_list
+        # set signal handler
         signal.signal(signal.SIGINT, self._signal)
         signal.signal(signal.SIGTERM, self._signal)
- 
+        # wait thread
         while active_count() > 1:
             with self.condition:
-                self.stop = False
-                self.condition.wait(THREAD_WAIT)
+                self.condition.wait(300)
                 if self.stop:
                     with self.queue_condition:
                         self.queue_stop = True
                         self.queue_condition.notify()
-                    for ident in self.data.data_dict:
-                        self.data.set_value(key='stop', value=True, ident=ident)
+                    for ident in self.data.data:
+                        self.data.set_value(ident, 'stop', True)
 
     def _signal(self,signum, frame):
         """ for signal """
@@ -96,6 +91,7 @@ class Listener:
 
     def _listen(self, addr):
         """ start to listen the self.socket continuously """
+        ident = currentThread().ident
         # add socket and info
         host, port = _split_addr(addr)
         if not port:
@@ -103,21 +99,20 @@ class Listener:
         addr = ':'.join([host,str(port)])
         # socket bind
         listen_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        listen_socket.settimeout(SOCK_WAIT)
+        listen_socket.settimeout(3)
         try:
             listen_socket.bind((host, int(port)))
             self.logger.info('start @ %s' % addr)
         except socket.error, detail:
-            listen_socket.close()
             self.logger.error('socket error %s\n' % detail)
             self.logger.error('listen failed @ %s' % addr)
         else:
-            listen_info = {'addr':addr, 'socket':listen_socket, 'stop':False}
-            self.data.set_info(listen_info)
+            listen_data = {'addr':addr, 'socket':listen_socket, 'stop':False}
+            self.data.set_data(ident, listen_data)
             # listen continuously
-            while not self.data.get_value('stop'):
+            while not self.data.get_value(ident,'stop'):
                 try:
-                    listen_socket.listen(SOCK_BACKLOG)
+                    listen_socket.listen(1) # backlog
                     conn, conn_addr = listen_socket.accept()
                     # wait to be connected
                     self.logger.info('%s is connected by %s' % (addr,conn_addr[0]))
@@ -129,10 +124,10 @@ class Listener:
                     break
                 # enqueue on another thread 
                 enqueue_thread = _add_thread(self._enqueue, args=(conn,))
-            listen_socket.close()
-            self.data.del_info()
+            self.data.del_data(ident)
             self.logger.info('listen end @ %s' % addr)
         finally:
+            listen_socket.close()
             with self.condition:
                 self.condition.notify()
 
@@ -141,7 +136,7 @@ class Listener:
         # receive a message
         while True:
             try:
-                message = conn.recv(RECV_SIZE)
+                message = conn.recv(4096) # bufsize
                 break
             except socket.error, detail:
                 self.logger.error('socket.error: %s' % detail)
@@ -149,29 +144,40 @@ class Listener:
         # react a message
         self._react(conn, message)
         # enqueue a message
-        if message.split()[0] == 'enqueue':
-            queue_message = ' '.join(message.split()[1:])
-            with self.queue_condition:
-                self.queue.put(queue_message)
-                self.queue_condition.notify()
+        message_list = message.split()
+        if message_list.pop(0) == 'enqueue':
+            queue_message = ' '.join(message_list)
+            if queue_message:
+                with self.queue_condition:
+                    self.queue.put(queue_message)
+                    self.queue_condition.notify()
         conn.close()
         
     def _react(self, conn, message):
         """ react for the message """
         message_list = message.split()
         message_len = len(message_list)
-        send_message = ''
+        send_message = ' '
         if message_list[0] == 'socket':
             if message_len > 1:
                 if message_list[1] == 'list':
                     addr_list = []
-                    for ident in self.data.data_dict:
-                        ident = str(ident)
-                        addr_list.append(self.data.data_dict[ident]['addr'])
-                    send_message = ', '.join(addr_list)
+                    for ident in self.data.data:
+                        addr_list.append(self.data.data[str(ident)]['addr'])
+                    send_message = '\n'.join(addr_list)
+                    self.logger.info('send socket list')
+        elif message_list[0] == 'queue':
+            if message_len > 1:
+                if message_list[1] == 'num':
+                    send_message = str(self.queue.qsize())
+                    self.logger.info('send queue.qsize')
+                elif message_list[1] == 'list':
+                    queue_list = []
+                    for queue in self.queue:
+                        queue_list.append(str(queue))
+                    send_message = '\n'.join(queue_list)
         else:
-            if self.react:
-                send_message = self.react(message)
+            send_message = self.react(message)
         conn.send(send_message)
 
     def _dequeue(self):
@@ -182,61 +188,52 @@ class Listener:
         while not self.queue_stop:
             with self.queue_condition:
                 try:
-                    queue_message = self.queue.get(timeout=QUEUE_WAIT)
+                    queue_message = self.queue.get(timeout=0.3)
                     addr = queue_message.split()[0]
                     message = ' '.join(queue_message.split()[0:])
                     self.queue_act(message)
                 except Empty:
-                    self.queue_condition.wait(COND_WAIT)
+                    self.queue_condition.wait(60)
         with self.condition:
             self.stop = True
             self.condition.notify()
         self.logger.info('queue end')
 
+    def react(self, message):
+        self.logger.info('react to message "%s"' % message)
+        return ''
+
     def queue_act(self, message):
-        """ react the message """
         self.logger.info('queue_act to message "%s"' % message)
 
-class ListenData():
-    """ info dictionary for listen """
+class DictData():
+    """ data dictionary """
     def __init__(self):
-        """ prepare """
         self.data_condition = Condition()
-        self.data_dict = {}
+        self.data = {}
 
-    def set_info(self, info):
-        """ set listen info """
-        ident = currentThread().ident
+    def set_data(self, ident, info):
         with self.data_condition:
-            self.data_dict[str(ident)] = info
+            self.data[str(ident)] = info
     
-    def set_value(self, key, value, ident=None):
-        if not ident:
-            ident = currentThread().ident
+    def set_value(self, ident, key, value):
         with self.data_condition:
-            self.data_dict[str(ident)][str(key)] = value
+            self.data[str(ident)][str(key)] = value
 
-    def del_info(self):
-        """ del listen info """
-        ident = currentThread().ident
+    def del_data(self, ident):
         with self.data_condition:
-            del self.data_dict[str(ident)]
+            del self.data[str(ident)]
 
-    def get_value(self, key, ident=None):
-        """ set listen info """
-        if not ident:
-            ident = currentThread().ident
+    def get_value(self, ident, key):
         with self.data_condition:
-            return self.data_dict[str(ident)][key]
-        
-    def search_info(self, key, value):
-        """ search info return ident """
-        key = str(key)
+            return self.data[str(ident)][key]
+
+    def search_data(self, key, value):
         with self.data_condition:
-            for ident in self.data_dict:
-                if self.data_dict[str(ident)][key] == value:
-                    return self.data_dict[str(ident)]
-        return None
+            for ident in self.data:
+                if self.data[str(ident)][str(key)] == value:
+                    return self.data[str(ident)]
+            return None
 
 def _add_thread(target, args=()):
     """ start a thread """
@@ -262,15 +259,18 @@ def speak(message_list, addr='127.0.0.1'):
         port = LISTEN_PORT
     message = ' '.join(message_list)
     speak_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    speak_socket.settimeout(60)
     try:
         speak_socket.connect((host, port))
         speak_socket.send(message)
     except socket.error, detail:
         speak_socket.close()
         sys.exit('socket error: "%s"' % detail)
+    except socket.timeout:
+        sys.exit('timeout')
     else:
         # accept message
-        message = speak_socket.recv(RECV_SIZE)
+        message = speak_socket.recv(4096) # bufsize
         if message:    
             sys.stdout.write('%s\n' % message)
 
