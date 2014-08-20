@@ -7,6 +7,7 @@ import socket
 import signal
 import logging
 import threading
+from operator import attrgetter
 try:
     from daemon import DaemonContext
     from lockfile.pidlockfile import PIDLockFile
@@ -23,25 +24,21 @@ class Listener:
         """ prepare """
         # make data
         self.condition = threading.Condition()
-        self.queue_data = DataDictionary()
-        self.socket_data = DataDictionary()
-        self.ident = IdentInt(idfile=IDFILE)
+        self.queue_condition = threading.Condition()
+        self.ident = TalkIdent(idfile=IDFILE)
+        self.talk_sockets = []
+        self.talk_queues = []
+        self.talk_listeners = []
+        self.talk_actors = []
         # make log
         self.logger = logging.getLogger()
         self.logger.setLevel(logging.DEBUG)
         # initialize value
-        self.queue_list = ['default']
-        self.socket_list = ['127.0.0.1']
         self.is_daemon = False
         self.stop = False
-
-    def add_queue(self, name):
-        """ add queue before start """
-        self.queue_list.append(name)
-
-    def add_socket(self, addr):
-        """ add queue before start """
-        self.socket_list.append(addr)
+        self.queue_names = ['05_default']
+        self.socket_addrs = ['127.0.0.1']
+        self.actor_num = 2
 
     def daemonize(self, pidfile, logfile):
         """ deamone process """
@@ -66,20 +63,21 @@ class Listener:
             logging.basicConfig(format=LOG_FORMAT)
         self.logger.info('-- listen start --')
         # start threads
-        for name in self.queue_list:
-            _add_thread(self._dequeue, args=(name,))
-        for addr in self.socket_list:
-            _add_thread(self._listen, args=(addr,))
+        for queue_name in self.queue_names:
+            self.add_queue(queue_name)
+        for socket_addr in self.socket_addrs:
+            talk_socket = self.add_socket(socket_addr)
+            _add_thread(self._listen, args=(socket_addr,))
+        for num in range(0, self.actor_num):
+            _add_thread(self._act, args=(num,))
         # set signal handler
         signal.signal(signal.SIGINT, self._signal)
         signal.signal(signal.SIGTERM, self._signal)
         # wait thread
-        while threading.active_count() > 2:
+        while threading.active_count() > 2 and not self.stop:
             with self.condition:
                 self.condition.wait(300)
-                if self.stop:
-                    self.logger.info('-- listen end --')
-                    break
+        self.logger.info('-- listen end --')
 
     def _signal(self, signum, frame):
         """ for signal """
@@ -90,51 +88,73 @@ class Listener:
             self.stop = True
             self.condition.notify()
 
+    def add_queue(self, queue_name):
+        """ add queue """
+        talk_queue = TalkQueue(queue_name)
+        self.talk_queues.append(talk_queue)
+        sorted(self.talk_queues, key=attrgetter('name'))
+        self.logger.info('"%s" queue start' % queue_name)
+        return talk_queue
+
+    def del_queue(self, queue_name):
+        """ delete queue """
+        with self.queue_condition:
+            if _del_from_list(self.talk_queues, hash(queue_name)):
+                self.logger.info('"%s" queue end' % queue_name)
+
+    def add_socket(self, addr):
+        """ add socket """
+        try:
+            talk_socket = TalkSocket(addr)
+        except TalkError, detail:
+            self.logger.error('"%s" socket failed to start because %s' % (addr,detail))
+        else:
+            self.talk_sockets.append(talk_socket)
+            self.logger.info('"%s" socket start' % talk_socket.addr)
+
+    def del_socket(self, addr):
+        """ delete socket """
+        (host, port) = _split_addr(addr)
+        addr = ':'.join([host,str(port)])
+        if _del_from_list(self.talk_sockets, hash(addr)):
+            self.logger.info('"%s" socket end' % addr)
+
     def _listen(self, addr):
         """ start to listen the socket continuously """
-        ident = threading.currentThread().ident
-        (host, port) = _split_addr(addr)
-        if not port:
-            port = LISTEN_PORT
-        addr = ':'.join([host,str(port)])
-        # add socket
-        listen_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        listen_socket.settimeout(3)
-        try:
-            listen_socket.bind((host, int(port)))
-            self.logger.info('listen start @ %s' % addr)
-        except socket.error, detail:
-            self.logger.error('listen failed @ %s because %s' % (addr,detail))
-        else:
-            # put socket info
-            socket_info = {'addr':addr, 'socket':listen_socket, 'status':'Start'}
-            self.socket_data.put_info(ident, socket_info)
-            # listen continuously
-            while not self.socket_data.get_value(ident,'status') == 'Stop':
-                try:
-                    self.socket_data.set_value(ident, 'status', 'Listen')
-                    listen_socket.listen(1) # backlog
-                    (conn, conn_addr) = listen_socket.accept()
-                    # wait to be connected
-                    self.logger.debug('%s is connected by %s' % (addr,conn_addr[0]))
-                except socket.timeout:
-                    continue
-                except socket.error, (errno, detail):
-                    if not errno == 9:
-                        self.logger.error('socket.error "%s"' % detail)
+        # listen thread info
+        talk_listener = TalkListener(addr)
+        listener_ident = talk_listener.ident
+        addr = talk_listener.addr
+        self.talk_listeners.append(talk_listener)
+       # listen continuously
+        while not _get_list_status(self.talk_listeners, listener_ident) == 'Stop':
+            _set_list_status(self.talk_listeners, listener_ident, 'Listen')
+            # get talk_socket
+            for talk_socket in self.talk_sockets:
+                if talk_socket.addr == addr:
                     break
-                else:
-                    # enqueue on another thread
-                    self.socket_data.set_value(ident, 'status', 'Enqueue')
-                    enqueue_thread = _add_thread(self._enqueue, args=(conn,))
-            self.socket_data.del_info(ident)
-            self.logger.info('listen end @ %s' % addr)
-        finally:
-            listen_socket.close()
-            with self.condition:
-                self.condition.notify()
+            else:
+                self.logger.error('can not find "%s" socket' % addr)
+                break 
+            # listen
+            try:
+                (conn,conn_addr) = talk_socket.listen()
+            except TalkError, detail:
+                self.logger.error('socket error @ "%s" because "%s"' % (addr,detail))
+                break
+            else:
+                # enqueue on another thread
+                self.logger.debug('"%s" is connected by "%s:%d"' % (addr,conn_addr[0],conn_addr[1]))
+                _set_list_status(self.talk_listeners, listener_ident, 'Report')
+                enqueue_thread = _add_thread(self._enqueue, args=(conn,conn_addr,))
+        # end
+        self.del_socket(addr)
+        _del_from_list(self.talk_listeners, listener_ident)
+        with self.condition:
+            self.condition.notify()
+        self.logger.info('listen end @ %s' % addr)
 
-    def _enqueue(self, conn):
+    def _enqueue(self, conn, conn_addr):
         """ enqueue to the queue """
         # receive a message
         is_error = False
@@ -142,8 +162,6 @@ class Listener:
             try:
                 message = conn.recv(4096) # bufsize
                 message_list = message.split()
-                message_len = len(message_list)
-                conn_addr = conn.getsockname()
                 self.logger.debug('from %s:%d get message "%s"' % (conn_addr[0],conn_addr[1],message))
                 break
             except socket.error, detail:
@@ -152,140 +170,200 @@ class Listener:
                     is_error = True
                 continue
         # check a message
+        (reply_message, queue, queue_message) = self.check_message(message_list)
+        # enqueue message
+        if queue_message:
+            with self.queue_condition:
+                message_ident = self.ident.get()
+                queue.put_item(message_ident, queue_message)
+                # editable enqueue_act function
+                reply_message = self.enqueue_act(queue.name, queue_message, message_ident)
+                self.queue_condition.notify()
+        # reply message
+        conn.send(reply_message)
+        conn.close()
+
+    def _act(self, num):
+        """ dequeue from queue and act """
+        # act thread info
+        talk_actor = TalkActor(num)
+        actor_ident = talk_actor.ident
+        actor_name = talk_actor.name
+        self.talk_actors.append(talk_actor)
+        self.logger.info('actor "%s" start' % actor_name)
+        # get item from queue continuously
+        while not _get_list_status(self.talk_actors, actor_ident) == 'Stop':
+            _set_list_status(self.talk_actors, actor_ident, 'Wait')
+            queue_message = None
+            with self.queue_condition:
+                while not queue_message:
+                    # for all queue
+                    for queue in self.talk_queues:
+                        (queue_message, message_ident) = queue.get_item()
+                        if queue_message:
+                            self.logger.debug('actor "%s" get message "%s" from "%s"' % (actor_name,queue_message,queue.name))
+                            break
+                    else:
+                        self.queue_condition.wait(60)
+            # act
+            _set_list_status(self.talk_actors, actor_ident, ('Act %d' % message_ident))
+            self.dequeue_act(queue.name, queue_message, message_ident)
+        # end
+        with self.condition:
+            self.condition.notify()
+        _del_from_list(self.talk_actors, actor_ident)
+        self.logger.info('act thread %d end' % num)
+
+    def check_message(self, message_list):
+        message_len = len(message_list)
         reply_message = ''
+        queue = None
         queue_message = None
         if message_list[0] == 'socket':
             # socket info
             reply_message = 'Usage: socket [list]'
             if message_len > 1:
                 if message_list[1] == 'list':
-                    addr_list = self.socket_data.list_value('addr')
+                    addr_list = []
+                    for listener in self.talk_listeners:
+                        addr_list.append('%s %s' % ('{0:<16}'.format(listener.addr),listener.status))
                     reply_message = '\n'.join(addr_list)
                     self.logger.info('send socket list')
         elif message_list[0] == 'queue':
-            # queue info
+            # manage queue
             reply_message = 'Usage: queue [list]'
             if message_len > 1:
                 if message_list[1] == 'list':
                     name_list = []
-                    for name in self.queue_data.list_value('name'):
-                        name_list.append(name)
-                        reply_message = '\n'.join(name_list)
-                        self.logger.info('send queue list')
+                    for queue in self.talk_queues:
+                        idents = ''
+                        for ident in queue.idents:
+                            if idents:
+                                idents = ('%s %d' % (idents,ident))
+                            else:
+                                idents = ('%d' % ident)
+                        name_list.append('%s %s (%s)' % ('{0:<16}'.format(queue.name),queue.status,idents))
+                    reply_message = '\n'.join(name_list)
+                    self.logger.info('send queue list')
+        elif message_list[0] == 'actor':
+            # manage actor
+            reply_message = 'Usage: actor [list]'
+            if message_len > 1:
+                if message_list[1] == 'list':
+                    name_list = []
+                    for actor in self.talk_actors:
+                        name_list.append('%s %s' % ('{0:<16}'.format(actor.name),actor.status))
+                    reply_message = '\n'.join(name_list)
+                    self.logger.info('send queue list')
+
         elif message_list[0] == 'enqueue':
             # enqueue check
             reply_message = 'Usage: enqueue <queue> <message>'
             if len(message_list) > 1:
                 queue_name = message_list[1]
-                if queue_name in self.queue_data.list_value('name'):
-                    queue_info = self.queue_data.search_info('name', queue_name)
-                    if queue_info:
-                        queue = queue_info['queue']
-                        queue_condition = queue_info['condition']
-                        queue_ident = self.ident.get()
+                for queue in self.talk_queues:
+                    if queue_name == queue.name:
                         queue_message = ' '.join(message_list[2:])
-                    reply_message = ('enqueue to "%s" %d' % (queue_name,queue_ident))
-                else:
-                    send_message = ('cannot find "%s"' % queue_name)
-        # editable react function
-        new_message = self.react(message)
-        if new_message:
-            reply_message = new_message
-        # reply message
-        conn.send(reply_message)
-        # enqueue message
-        if queue_message:
-            with queue_condition:
-                queue.put_item(queue_ident, queue_message)
-                # editable enqueue_act function
-                self.enqueue_act(queue_ident, queue_name, queue_message)
-                queue_condition.notify()
-        conn.close()
+                        break
+                reply_message = ('cannot find "%s"' % queue_name)
+        return (reply_message, queue, queue_message)
 
-    def _dequeue(self, queue_name):
-        """ dequeue from the self.queue """
-        # put queue info
-        ident = threading.currentThread().ident
-        queue = QueueList()
-        queue_condition = threading.Condition()
-        queue_info = {'name':queue_name, 'queue':queue, 'condition':queue_condition, 'status':'Start'}
-        self.queue_data.put_info(ident, queue_info)
-        self.logger.info('"%s" queue start' % queue_name)
-        # queue check continuously
-        while not self.queue_data.get_value(ident,'status') == 'Stop':
-            queue_message = None
-            message_ident = None
-            with queue_condition:
-                try:
-                    message_ident, queue_message = queue.get_item()
-                    self.logger.debug('from "%s" get message "%s"' % (queue_name,queue_message))
-                except QueueListEmpty:
-                    self.queue_data.set_value(ident, 'status', 'Empty')
-                    queue_condition.wait(60)
-            if message_ident:
-                # editable dequeue_act function
-                self.queue_data.set_value(ident, 'status', 'Dequeue')
-                self.dequeue_act(message_ident, queue_name, queue_message)
-        with self.condition:
-            self.condition.notify()
-        self.queue_data.del_info(ident)
-        self.logger.info('"%s" queue end' % queue_name)
+    def enqueue_act(self, queue_name, queue_message, message_ident=0):
+        self.logger.info('enqueue to %s message [%d] "%s"' % (queue_name,message_ident,queue_message))
+        reply_message = ('enqueue to "%s" number %d' % (queue_name,message_ident))
+        return reply_message
 
-    def react(self, message):
-        self.logger.info('react to message "%s"' % message)
-        return ''
-
-    def enqueue_act(self, ident, name, message):
-        self.logger.info('enqueue to %s message [%d] "%s"' % (name, ident, message))
-
-    def dequeue_act(self, ident, message):
-        self.logger.info('dequeue from %s message [%d] "%s"' % (name, ident, message))
+    def dequeue_act(self, queue_name, queue_message, message_ident=0):
+        self.logger.info('dequeue from %s message [%d] "%s"' % (queue_name, message_ident, queue_message))
         time.sleep(30)
 
-class DataDictionary():
-    """ self data dictionary """
-    def __init__(self):
+class TalkError(Exception):
+    pass
+
+class TalkQueue:
+    def __init__(self, name):
+        self.name = name
+        self.status = 'Start'
+        self.ident = hash(name)
         self.condition = threading.Condition()
-        self.data = {}
+        self.queue = []
+        self.idents = []
 
-    def put_info(self, ident, info):
+    def put_item(self, ident, item):
         with self.condition:
-            self.data[str(ident)] = info
-    
-    def set_value(self, ident, key, value):
+            self.idents.append(ident)
+            self.queue.append(str(item))
+        self.status = 'Remain'
+
+    def get_item(self):
+        ident = None
+        item = None
         with self.condition:
-            self.data[str(ident)][str(key)] = value
+            if len(self.queue) > 0:
+                ident = self.idents.pop(0)
+                item = self.queue.pop(0)
+            else:
+                self.status = 'Empty'
+        return (item, ident)
 
-    def del_info(self, ident):
+    def list_item(self):
+        item_list = []
+        for ident,item in zip(self.idents,self.queue):
+            item_list.append('%s %s' %(str(ident).zfill(3),item))
+        return item_list 
+
+class TalkSocket:
+    def __init__(self, addr):
+        (host, port) = _split_addr(addr)
+        addr = ':'.join([host,str(port)])
+        self.addr = addr
+        self.ident = hash(addr)
+        self.status = 'Start'
+        self.condition = threading.Condition()
+        # add socket
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.socket.settimeout(30)
+        try:
+            self.socket.bind((host, int(port)))
+        except socket.error, (errno,detail): 
+            raise TalkError(detail)
+
+    def listen(self):
+        conn = None
+        conn_addr = None
         with self.condition:
-            del self.data[str(ident)]
+            while not conn:
+                try:
+                    self.socket.listen(1) # backlog
+                    (conn, conn_addr) = self.socket.accept()
+                    # wait to be connected
+                except socket.timeout:
+                    continue
+                except socket.error, (errno, detail):
+                    if not errno == 9: # EBADF
+                        self.socket.close()
+                    raise TalkError(detail)
+        return (conn, conn_addr)
 
-    def get_info(self, ident):
-        with self.condition:
-            return self.data[str(ident)]
+actor_names = ('Appleton', 'Bohr', 'Curie', 'Dirac', 'Einstein', 'Fermi', 'Guillaume', 'Hertz', 'Ioffe', 'Jensen',
+               'Koshiba', 'Lorentz', 'Michelson', 'Neel' ,'Onnes', 'Planck')
 
-    def get_value(self, ident, key):
-        with self.condition:
-            return self.data[str(ident)][key]
+class TalkActor:
+    def __init__(self, num):
+        self.ident = threading.currentThread().ident
+        self.status = 'Start'
+        self.num = num
+        self.name = actor_names[num]
 
-    def list_value(self, key):
-        value_list = []
-        with self.condition:
-            for ident in self.data:
-                value_list.append(self.data[str(ident)][key])
-        return value_list
+class TalkListener:
+    def __init__(self, addr):
+        self.ident = threading.currentThread().ident
+        self.status = 'Start'
+        (host, port) = _split_addr(addr)
+        addr = ':'.join([host,str(port)])
+        self.addr = addr
 
-    def search_info(self, key, value):
-        with self.condition:
-            for ident in self.data:
-                if self.data[str(ident)][str(key)] == value:
-                    return self.data[str(ident)]
-        return None
-
-class QueueListEmpty(Exception):
-        pass
-
-class IdentInt():
+class TalkIdent():
     def __init__(self, idfile=None):
         self.idfile = None
         self.ident = 0
@@ -314,34 +392,6 @@ class IdentInt():
             file.close()
         return self.ident
 
-class QueueList():
-    """ self queue list """
-    def __init__(self):
-        self.condition = threading.Condition()
-        self.queue = []
-        self.ident_list = []
-
-    def put_item(self, ident, item):
-        with self.condition:
-            self.ident_list.append(ident)
-            self.queue.append(str(item))
-        return ident
-
-    def get_item(self):
-        with self.condition:
-            try: 
-                ident = self.ident_list.pop(0)
-                item = self.queue.pop(0)
-            except IndexError:
-                raise QueueListEmpty, 'the queue list is empty'
-        return ident, item
-
-    def list_item(self):
-        item_list = []
-        for ident,item in zip(self.ident_list,self.queue):
-            item_list.append('%s %s' %(str(ident).zfill(3),item))
-        return item_list 
-
 def _add_thread(target, args=()):
     """ start a thread """
     new_thread = threading.Thread(target=target, args=args)
@@ -356,7 +406,29 @@ def _split_addr(addr):
     host = addr_list[0]
     if len(addr_list) > 1:
         port = int(addr_list[1])
-    return host, port
+    else:
+        port = LISTEN_PORT
+    return (host, port)
+
+def _del_from_list(list, ident):
+    for num,target in enumerate(list):
+        if target.ident == ident:
+            del list[num]
+            return True
+        return False
+ 
+def _set_list_status(list, ident, status):
+    for num,target in enumerate(list):
+        if target.ident == ident:
+            list[num].status = status
+            return True
+    return False
+
+def _get_list_status(list, ident):
+    for num,target in enumerate(list):
+        if target.ident == ident:
+            return list[num].status
+    return None
 
 def speak(message, addr='127.0.0.1'):
     """ speak through a socket """

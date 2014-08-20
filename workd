@@ -55,7 +55,6 @@ class Worker(Listener):
         jobinfo.uid = int(job_info['uid'])
         jobinfo.gid = int(job_info['gid'])
         jobinfo.cwd = job_info['cwd']
-        print jobinfo.cwd
         jobinfo.shell = job_info['shell']
         self.logger.info('%s work start' % log_prefix)
         # get job_message 
@@ -69,7 +68,7 @@ class Worker(Listener):
             import prework
             self.logger.info('%s prework done' % log_prefix)
         except ImportError:
-            pass
+            self.logger.warn('%s no prework' % log_prefix)
         # work
         outdir = ('%s' % queue_name)
         if not os.path.exists(outdir):
@@ -84,7 +83,6 @@ class Worker(Listener):
         file = open(job_out, 'w')
         # popen
         try:
-            print os.getcwd()
             popen = Popen((jobinfo.shell, job_script), stdout=file, stderr=file)
             self.logger.debug('%s popen "%s"' % (log_prefix,job_message))
             self.job_data.set_value(ident, 'status', 'Running')
@@ -92,16 +90,17 @@ class Worker(Listener):
             popen.communicate()
         except OSError, detail:
             self.logger.error('OSError: %s', detail)
+        finally:
+            file.close()
         jobinfo.returncode = popen.returncode
-        file.close()
         # postwork
         self.job_data.set_value(ident, 'status', 'PostWork')
         try:
             import postwork
             self.logger.info('%s postwork done' % log_prefix)
         except ImportError:
-            pass
-        self.job_data.set_value(ident, 'status', 'Running')
+            self.logger.warn('%s no postwork' % log_prefix)
+        self.job_data.set_value(ident, 'status', 'Finished')
 
 def usage():
     sys.stdout.write('usage: %s [start|status|stop]\n' % sys.argv[0])
@@ -116,18 +115,21 @@ def _get_pid_from_file(pidfile):
 if __name__ == "__main__":
     if len(sys.argv) > 1:
         if sys.argv[1] == 'start':
+            # start a daemon
             if not os.getuid() == 0:
                 sys.exit('Error: You must be root')
             worker = Worker()
             worker.daemonize(pidfile=PID_FILE, logfile=LOG_FILE)
             sys.stdout.write('Info: Worker daemon start\n')
         elif sys.argv[1] == 'status':
+            # check the daemon status
             pid = _get_pid_from_file(PID_FILE)
             if pid in psutil.get_pid_list():
                 sys.stdout.write('Info: Worker is running\n')
             else:
                 sys.exit('Error: Worker is not running')
         elif sys.argv[1] == 'stop':
+            # kill the daemon
             if not os.getuid() == 0:
                 sys.exit('Error: You must be root')
             pid = _get_pid_from_file(PID_FILE)
@@ -137,6 +139,7 @@ if __name__ == "__main__":
             except OSError, detail:
                 sys.exit('Error: Cannot kill Worker: %s' % detail)
         elif sys.argv[1] == 'run':
+            # start a process
             if not os.getuid() == 0:
                 sys.exit('Error: You must be root')
             worker = Worker()
