@@ -2,115 +2,241 @@
 
 import os
 import sys
+import pwd
 import shlex
 from subprocess import Popen 
 from signal import SIGTERM
 try:
     import psutil
-    from talk import Listener,DataDictionary
-    import jobinfo
+    from talk import TalkManager
 except ImportError, detail:
     sys.exit('ImportError: %s' % detail)
 
 PID_FILE = '/var/run/workd.pid'
 LOG_FILE = './workd.log'
+ID_FILE = '/var/run/work.id'
+DB_FILE = '/var/tmp/workd.db'
+JOB_DIR = '/var/tmp/jobs'
+WORK_DIR = '/var/tmp/work'
 
-class Worker(Listener):
+class WorkManager(TalkManager):
     def __init__(self):
-        Listener.__init__(self)
-        self.job_data = DataDictionary()
+        TalkManager.__init__(self, idfile=ID_FILE)
+        self.jobs = {}
+        if not os.path.exists(JOB_DIR): os.mkdir(JOB_DIR)
+        if not os.path.exists(WORK_DIR): os.mkdir(WORK_DIR)
 
-    def react(self, message):
-        pass
+    def _manage_socket(self, messages):
+        reply_message = ''
+        message_len = len(messages)
+        # socket info
+        if message_len > 1:
+            if messages[1] == 'list':
+                info = []
+                for (addr, listener) in self.listeners.iteritems():
+                    info.append('%s %s' % (addr,listener.status))
+                reply_message = ('%s' % '\n'.join(info))
+                self.logger.debug('send socket list')
+            elif messages[1] == 'add':
+                if message_len > 2:
+                    if self.add_listener(messages[2]): 
+                        reply_message = messages[2]
+            elif messages[1] == 'del':
+                if message_len > 2:
+                    if self.del_listener(messages[2]):
+                        reply_message = messages[2] 
+        return reply_message
+ 
+    def _manage_queue(self, messages):
+        reply_message = ''
+        message_len = len(messages) 
+        # manage queue
+        if message_len > 1:
+            if messages[1] == 'list':
+                info = []
+                for name in sorted(self.queues):
+                    info.append('%s %s' % (name,self.queues[name].status))
+                reply_message = ('%s' % '\n'.join(info))
+                self.logger.debug('send queue list')
+            elif messages[1] == 'add':
+                if message_len > 2:
+                    if self.add_queue(messages[2]):
+                        reply_message = messages[2]
+            elif messages[1] == 'del':
+                if message_len > 2:
+                    if self.del_queue(messages[2]):
+                        reply_message = messages[2]
+        return reply_message
 
-    def enqueue_act(self, ident, queue_name, message):
-        message_list = message.split()
-        uid = 0
-        gid = 0
-        cwd = ''
-        shell = '/bin/sh'
-        job = ''
-        for num,word in enumerate(message_list):
-            if word == 'UID':
-                uid = message_list[num + 1]
-            elif word == 'GID':
-                gid = message_list[num + 1]
-            elif word == 'CWD':
-                cwd = message_list[num + 1]
-            elif word == 'SHELL':
-                shell = message_list[num + 1]
-            elif word == 'JOB':
-                job = message_list[num + 1]
-        job_info = {'queue':queue_name, 'uid':uid, 'gid':gid, 'cwd':cwd, 'shell':shell, 'job':job,
-                    'status':'Queued', 'popen':None}
-        self.job_data.put_info(ident, job_info)
+    def _manage_worker(self, messages):
+        reply_message = ''
+        message_len = len(messages)
+        # manage worker
+        if message_len > 1:
+            if messages[1] == 'list':
+                info = []
+                for (name, worker) in self.workers.iteritems():
+                    info.append('%s %s' % (name,worker.status))
+                reply_message = ('%s' % '\n'.join(info))
+                self.logger.debug('send worker list')
+            elif messages[1] == 'add':
+                if message_len > 2:
+                    if self.add_worker(messages[2]):
+                        reply_message = messages[2]
+            elif messages[1] == 'del':
+                if message_len > 2:
+                    if self.del_worker(messages[2]):
+                        reply_message = messages[2]
+        return reply_message
 
-    def dequeue_act(self, ident, queue_name, message):
+    def _manage_job(self,messages):
+        reply_message = ''
+        message_len = len(messages)
+        # manage worker
+        if message_len > 1:
+            if messages[1] == 'list':
+                info = []
+                for (ident) in sorted(self.jobs):
+                    user = self.jobs[ident].user
+                    queue = self.jobs[ident].queue
+                    status = self.jobs[ident].status
+                    info.append('%s %s %s %s' % (ident,user,queue,status))
+                reply_message = ('%s' % '\n'.join(info))
+                self.logger.debug('send job list')
+            elif messages[1] == 'info':
+                if message_len > 2:
+                    for ident in self.jobs:
+                        if ident == messages[2]:
+                            uid = self.jobs[ident].uid
+                            user = self.jobs[ident].user
+                            host = self.jobs[ident].host
+                            queue = self.jobs[ident].queue
+                            command = self.jobs[ident].job.split()[0]
+                            status = self.jobs[ident].status
+                            reply_message = ('%d %s %s %s %s %s' 
+                                             % (uid,user,host,queue,command,status))
+                            self.logger.debug('send job %s info' % ident)
+            elif messages[1] == 'add':
+                if message_len > 2:
+                    jobid = self.add_job(messages[2:])
+                    if jobid > 0:
+                        reply_message = ('%d' % jobid)
+            elif messages[1] == 'del':
+                if message_len > 2:
+                    if self.del_job(messages[2]):
+                        reply_message = messages[2]
+        return reply_message
+ 
+    def check_messages(self, messages):
+        """ check messages """
+        reply_message = ''
+        message_len = len(messages)
+        if message_len > 0:
+            if messages[0] == 'socket': reply_message = self._manage_socket(messages)
+            elif messages[0] == 'queue': reply_message = self._manage_queue(messages)
+            elif messages[0] == 'worker': reply_message = self._manage_worker(messages)
+            elif messages[0] == 'job': reply_message = self._manage_job(messages)
+        return reply_message
+
+    def queue_work(self, queue_name, message, ident):
         """ start work """
-        log_prefix = ('[%s-%s]' % (queue_name,str(ident).zfill(3)))
-        # set jobinfo
-        job_info = self.job_data.get_info(ident)
-        jobinfo.jobid = ident
-        jobinfo.queue = job_info['queue']
-        jobinfo.uid = int(job_info['uid'])
-        jobinfo.gid = int(job_info['gid'])
-        jobinfo.cwd = job_info['cwd']
-        jobinfo.shell = job_info['shell']
-        self.logger.info('%s work start' % log_prefix)
-        # get job_message 
-        message_list = message.split()
-        for num, word in enumerate(message_list):
-            if word == 'JOB':
-                job_message = ' '.join(message_list[num + 1:])
-        # prework
-        self.job_data.set_value(ident, 'status', 'PreWork')
-        try:
-            import prework
-            self.logger.info('%s prework done' % log_prefix)
-        except ImportError:
-            self.logger.warn('%s no prework' % log_prefix)
-        # work
-        outdir = ('%s' % queue_name)
-        if not os.path.exists(outdir):
-            os.mkdir(outdir)
+        ident = str(ident)
+        ident_name = ident.zfill(3)
+        log_prefix = ('[%s-%s]' % (queue_name,ident_name))
+        # dir
+        job_dir = JOB_DIR
+        work_dir = ('%s/%s' % (WORK_DIR,self.jobs[ident].user))
+        if not os.path.exists(work_dir):
+            os.mkdir(work_dir)
         # write job script
-        job_script = ('%s/job-%s.sh' % (outdir,str(ident).zfill(3)))
+        job_script = ('%s/job-%s.sh' % (job_dir,ident_name))
         file = open(job_script, 'w')
-        file.write(job_message)
+        file.write(message)
         file.close()
+        os.chmod(job_script, 0755)
         # open job out file
-        job_out = ('%s/job-%s.out' % (outdir,str(ident).zfill(3)))
+        job_out = ('%s/job-%s.out' % (job_dir,ident_name))
         file = open(job_out, 'w')
         # popen
         try:
-            popen = Popen((jobinfo.shell, job_script), stdout=file, stderr=file)
-            self.logger.debug('%s popen "%s"' % (log_prefix,job_message))
-            self.job_data.set_value(ident, 'status', 'Running')
-            self.job_data.set_value(ident, 'popen', popen)
-            popen.communicate()
+            self.logger.info('%s job start' % log_prefix)
+            popen = Popen(job_script, shell=True, stdout=file, stderr=file, 
+                          cwd=work_dir, preexec_fn=self.preexec_fn(self.jobs[ident]))
         except OSError, detail:
             self.logger.error('OSError: %s', detail)
-        finally:
-            file.close()
-        jobinfo.returncode = popen.returncode
-        # postwork
-        self.job_data.set_value(ident, 'status', 'PostWork')
-        try:
-            import postwork
-            self.logger.info('%s postwork done' % log_prefix)
-        except ImportError:
-            self.logger.warn('%s no postwork' % log_prefix)
-        self.job_data.set_value(ident, 'status', 'Finished')
+        else:
+            self.logger.debug('%s popen "%s"' % (log_prefix,message))
+            self.jobs[ident].status = 'Run'
+            self.jobs[ident].pid = popen.pid 
+            popen.communicate()
+            self.jobs[ident].returncode = popen.returncode
+            self.logger.info('%s job end %d' % (log_prefix,popen.returncode))
+        file.close()
+        if not popen.returncode == 0:
+            self.jobs[ident].status = 'Error'
+        else:
+            self.jobs[ident].status = 'Finish'
+
+    def add_job(self, messages):
+        # check messages
+        job_info = WorkJob()
+        for num,word in enumerate(messages):
+            if word == 'UID': job_info.uid = int(messages[num + 1])
+            elif word == 'USER': job_info.user = (messages[num + 1])
+            elif word == 'HOST': job_info.host = (messages[num + 1])
+            elif word == 'QUEUE': job_info.queue = messages[num + 1]
+            elif word == 'JOB': job_info.job = ' '.join(messages[num + 1:])
+        # add job
+        if len(job_info.queue) > 0 and len(job_info.job) > 0:
+            ident = self.enqueue_message(job_info.queue, job_info.job)
+            if ident > 0:
+                with self.list_condition:
+                    self.jobs[str(ident)] = job_info
+                return ident
+        return -1
+
+    def del_job(self, ident):
+        for name in self.jobs:
+            if name == ident:
+                if self.jobs[str(ident)].returncode == None:
+                    try:
+                        os.kill(self.jobs[str(ident)].pid, SIGTERM)
+                    except OSError, detail:
+                        return False
+                for name in self.queues:
+                    if self.queues[name].del_item(int(ident)):
+                        break
+                with self.list_condition:
+                    del self.jobs[str(ident)]
+                return True
+        return False
+
+    def preexec_fn(self, job):
+        uid = job.uid
+        def preexec():
+            os.setuid(uid)
+        return preexec
+
+class WorkJob:
+    def __init__(self):
+        self.uid = 0
+        self.job = ''
+        self.user = ''
+        self.host = ''
+        self.queue = ''
+        self.status = 'Queued'
+        self.pid = None
+        self.returncode = None
 
 def usage():
-    sys.stdout.write('usage: %s [start|status|stop]\n' % sys.argv[0])
+    sys.stdout.write('Usage: workd [start|status|stop]\n')
 
 def _get_pid_from_file(pidfile):
     try:
         file = open(pidfile, 'r')
         return int(file.read())
     except IOError, detail:
-        sys.exit('Worker is not running')
+        sys.exit('Info: Worker is not running')
 
 if __name__ == "__main__":
     if len(sys.argv) > 1:
@@ -118,9 +244,8 @@ if __name__ == "__main__":
             # start a daemon
             if not os.getuid() == 0:
                 sys.exit('Error: You must be root')
-            worker = Worker()
+            worker = WorkManager()
             worker.daemonize(pidfile=PID_FILE, logfile=LOG_FILE)
-            sys.stdout.write('Info: Worker daemon start\n')
         elif sys.argv[1] == 'status':
             # check the daemon status
             pid = _get_pid_from_file(PID_FILE)
@@ -142,7 +267,7 @@ if __name__ == "__main__":
             # start a process
             if not os.getuid() == 0:
                 sys.exit('Error: You must be root')
-            worker = Worker()
+            worker = WorkManager()
             worker.start() 
         else:
             usage()

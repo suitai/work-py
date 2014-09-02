@@ -128,7 +128,7 @@ class TalkManager:
         """ get a message and check """
         # receive a message
         is_error = False
-        for num in range(0,30):
+        for num in range(0,9):
             try:
                 message = conn.recv(4096) # bufsize
                 self.logger.debug('from %s:%d get message "%s"' 
@@ -162,7 +162,7 @@ class TalkManager:
                     (queue_message, message_ident) = self.queues[name].get_item()
                     break
                 else:
-                    self.queue_condition.wait(60)
+                    self.queue_condition.wait(300)
             if queue_message:
                 self.logger.debug('worker "%s" get message "%s" from "%s"'
                                    % (worker_name,queue_message,name))
@@ -291,7 +291,7 @@ def speak(message, addr='127.0.0.1'):
     # send message
     (host, port) = _split_addr(addr)
     speak_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    speak_socket.settimeout(60)
+    speak_socket.settimeout(300)
     try:
         speak_socket.connect((host,port))
         speak_socket.send(message)
@@ -304,8 +304,7 @@ def speak(message, addr='127.0.0.1'):
     else:
         # accept message
         message = speak_socket.recv(4096) # bufsize
-        if message:
-            sys.stdout.write('%s\n' % message)
+        return message
 
 class TalkError(Exception):
     pass
@@ -322,7 +321,7 @@ class TalkQueue:
         with self.condition:
             self.idents.append(ident)
             self.items.append(str(item))
-        self.status = 'Remain'
+        self.status = ('Remain %d' % len(self.items))
 
     def get_item(self):
         with self.condition:
@@ -352,7 +351,7 @@ class TalkSocket:
         # add socket
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.socket.settimeout(60)
+        self.socket.settimeout(300)
         try:
             self.socket
             self.socket.bind((self.host, int(self.port)))
