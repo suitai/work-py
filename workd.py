@@ -31,101 +31,82 @@ class WorkManager(Conversation):
     def manage_fn(self, message):
         """ check messages to manage talkmanager"""
         reply = ''
+        operate = None
+        info = None
         messages = message.split()
         message_len = len(messages)
-        if message_len > 0:
-            target = {'socket': self._manage_socket,
+        if message_len > 1:
+            operate = messages[1]
+            if message_len > 2:
+                info = messages[2:]
+            target = {'socket': self._manage_listener,
                       'queue': self._manage_queue,
                       'worker': self._manage_worker,
-                      'job': self._manage_job}
+                      'info': self._manage_job}
             if messages[0] in target.keys():
-                self.logger.info('manage %s %s' % (messages[0], messages[1]))
-                reply = target.get(messages[0])(messages)
+                reply = target.get(messages[0])(operate, info)
         return reply
 
-    def _manage_socket(self, messages):
+    def _manage_listener(self, operate, info=None):
         reply = ''
-        message_len = len(messages)
+        self.logger.debug('manage listener %s' % operate)
         # socket info
-        if message_len == 1:
-            if messages[1] == 'list':
-                list = []
-                for (addr, listener) in self.listeners.iteritems():
-                    list.append('%s %s' % (addr, listener.status))
-                reply = ('%s' % '\n'.join(list))
-                self.logger.debug('send socket list')
-        elif message_len > 1:
-            if messages[1] == 'add':
-                if self.add_listener(messages[2]):
-                    reply = messages[2]
-            elif messages[1] == 'del':
-                if self.del_listener(messages[2]):
-                    reply = messages[2]
+        if operate == 'list':
+            reply = self.get_listener_list()
+        if info:
+            if operate == 'add':
+                if self.add_listener(info[0]):
+                    reply = info[0]
+            elif operate == 'del':
+                if self.del_listener(info[0]):
+                    reply = info[0]
         return reply
 
-    def _manage_queue(self, messages):
+    def _manage_queue(self, operate, info=None):
         reply = ''
-        message_len = len(messages)
+        self.logger.debug('manage queue %s' % operate)
         # manage queue
-        if message_len == 1:
-            if messages[1] == 'list':
-                list = []
-                for name in sorted(self.queues.keys()):
-                    list.append('%s %s' % (name, self.queues[name].status))
-                reply = ('%s' % '\n'.join(list))
-                self.logger.debug('send queue list')
-        elif message_len > 1:
-            if messages[1] == 'add':
-                if self.add_queue(messages[2]):
-                    reply = messages[2]
-            elif messages[1] == 'del':
-                if self.del_queue(messages[2]):
-                    reply = messages[2]
+        if operate == 'list':
+            reply = self.get_queue_list()
+        elif info:
+            if operate == 'add':
+                if self.add_queue(info[0]):
+                    reply = info[0]
+            elif operate == 'del':
+                if self.del_queue(info[0]):
+                    reply = info[0]
         return reply
 
-    def _manage_worker(self, messages):
+    def _manage_worker(self, operate, info=None):
         reply = ''
-        message_len = len(messages)
+        self.logger.debug('manage worker %s' % operate)
         # manage worker
-        if message_len == 1:
-            if messages[1] == 'list':
-                list = []
-                for (name, worker) in self.workers.iteritems():
-                    list.append('%s %s' % (name, worker.status))
-                reply = ('%s' % '\n'.join(list))
-                self.logger.debug('send worker list')
-        elif message_len > 1:
-            if messages[1] == 'add':
-                if self.add_worker(messages[2]):
-                    reply = messages[2]
-            elif messages[1] == 'del':
-                if self.del_worker(messages[2]):
-                    reply = messages[2]
+        if operate == 'list':
+            reply = self.get_worker_list()
+        elif info:
+            if operate == 'add':
+                if self.add_worker(info[0]):
+                    reply = info[0]
+            elif operate == 'del':
+                if self.del_worker(info[0]):
+                    reply = info[0]
         return reply
 
-    def _manage_job(self, messages):
+    def _manage_job(self, operate, info=None):
         reply = ''
-        message_len = len(messages)
         # manage worker
-        if message_len == 1:
-            if messages[1] == 'list':
-                list = []
-                for ident in sorted(self.jobs):
-                    info = self.jobs[ident].get_info('short')
-                    list.append('%s' % (ident, info))
-                reply = ('%s' % '\n'.join(list))
-                self.logger.debug('send job list')
-        elif message_len > 1:
-            if messages[1] == 'info' and messages[2] in self.jobs:
-                reply = self.jobs[messages[2]].get_info()
-                self.logger.debug('send job %s info' % ident)
-            elif messages[1] == 'add':
-                jobid = self.add_job(messages[2:])
+        if operate == 'list':
+                reply = self.get_job_list()
+        elif info:
+            if operate == 'info' and info[0] in self.jobs:
+                reply = self.get_job_info(info[0])
+            elif operate == 'add':
+                jobid = self.add_job(info)
                 if jobid > 0:
                     reply = ('%d' % jobid)
-            elif messages[1] == 'del':
-                if self.del_job(messages[2]):
-                    reply = messages[2]
+            elif operate == 'del':
+                if self.del_job(info[0]):
+                    reply = info[0]
         return reply
 
     def add_job(self, messages):
@@ -159,11 +140,22 @@ class WorkManager(Conversation):
                 return True
         return False
 
+    def get_job_list(self):
+        list = []
+        for job_id in sorted(self.jobs.keys()):
+            info = self.jobs[job_id].get_info('short')
+            list.append('%s' % (job_id, info))
+        self.logger.debug('get job list')
+        return ('%s' % '\n'.join(list))
+
+    def get_job_info(self, job_id):
+        self.logger.debug('send job %s info' % job_id)
+        return self.jobs[job_id.get_info()].get_info()
+
     def work_fn(self, queue_name, message, ident):
         """ start work """
         ident = str(ident)
         ident_name = ident.zfill(3)
-        log_prefix = ('[%s-%s]' % (queue_name, ident_name))
         # dir
         job = self.jobs[ident]
         workdir = ('%s/%s' % (self.workdir, job.user))
@@ -177,6 +169,7 @@ class WorkManager(Conversation):
         # open job out file
         job_out = ('%s/job-%s.out' % (self.jobdir, ident_name))
         with open(job_out, 'w') as f:
+            log_prefix = ('[%s-%s]' % (queue_name, ident_name))
             try:
                 # popen
                 self.logger.info('%s job start' % log_prefix)

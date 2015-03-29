@@ -3,11 +3,15 @@
 import os
 import sys
 from getopt import getopt, GetoptError
-from talk import Conversation
-from workd import WorkJob, ListenDaemon
+
+try:
+    from talk import Conversation
+    from workd import WorkJob, ListenDaemon
+except ImportError, detail:
+    sys.exit('ImportError: %s' % detail)
 
 
-class SubjobManager():
+class JobRequest():
 
     def __init__(self):
         self.conv = Conversation()
@@ -90,7 +94,7 @@ class SubjobManager():
 
 if __name__ == '__main__':
     """ command execution """
-    job = SubjobManager()
+    job = JobRequest()
     # handle options
     option = 'h'
     long_option = ['help', ]

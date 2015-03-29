@@ -1,12 +1,14 @@
 work-py
 =======
-An job scheduler for a workstation
+An job manager for a workstation
 
 USAGE
 ===
-To start a daemon
-`workd start`
+To start the daemon
+```python workd.py start```
 
-To submit a job command
-`wjob submit <command>`
+To stop the daemon
+```python workd.py stop```
 
+To run a job
+```python workjob.py run <command>```

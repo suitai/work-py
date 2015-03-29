@@ -1,7 +1,6 @@
-""" talk through a socket.socket """
+""" talk through a socket """
 
 import os
-import sys
 import time
 import socket
 import signal
@@ -45,7 +44,7 @@ class Conversation(object):
         # send message
         (host, port) = _split_addr(addr)
         speak_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        speak_socket.settimeout(300)
+        speak_socket.settimeout(5)
         try:
             speak_socket.connect((host, port))
             speak_socket.send(message)
@@ -84,7 +83,7 @@ class Conversation(object):
             raise TalkError('%s already exists' % lock.lock_file)
         # logfile
         handler = logging.FileHandler(logfile)
-        handler.level = logging.INFO
+        handler.level = logging.DEBUG
         handler.formatter = logging.Formatter(fmt=self.log_format)
         self.logger.addHandler(handler)
         # daemonize
@@ -131,10 +130,11 @@ class Conversation(object):
             self.queue_info.append(queue_name)
             return True
         else:
-            for name in self.queues:
+            for name in self.queues.keys():
                 if name == queue_name:
                     self.logger.warn('"%s" queue already exists' % queue_name)
                     return False
+            self.logger.info('"%s" queue start' % queue_name)
             talk_queue = TalkQueue(queue_name)
             with self.queue_condition:
                 with self.list_condition:
@@ -154,6 +154,13 @@ class Conversation(object):
                 self.logger.warn('cannot found "%s" queue' % queue_name)
                 return False
 
+    def get_queue_list(self):
+        list = []
+        for name in sorted(self.queues.keys()):
+            list.append('%s %s' % (name, self.queues[name].status))
+        self.logger.debug('get queue list')
+        return ('%s' % '\n'.join(list))
+
     def _signal(self, signum, frame):
         """ respond to signal """
         self.logger.info('received signal (%s)' % self.sig_names[signum])
@@ -171,7 +178,7 @@ class Conversation(object):
                 check_fn = self.check_fn
             (host, port) = _split_addr(socket_addr)
             socket_addr = ':'.join([host, str(port)])
-            for addr in self.listeners:
+            for addr in self.listeners.keys():
                 if addr == socket_addr:
                     self.logger.warn('"%s" listener already exists'
                                      % socket_addr)
@@ -201,6 +208,13 @@ class Conversation(object):
             except KeyError:
                 self.logger.warn('cannot find the "%s" listener' % socket_addr)
                 return False
+
+    def get_listener_list(self):
+        list = []
+        for listener in self.listeners.keys():
+            list.append('%s %s' % (listener, self.listeners[listener].status))
+        self.logger.debug('get lister list')
+        return ('%s' % '\n'.join(list))
 
     def _listen(self, socket_addr, check_fn):
         """ listen the socket """
@@ -239,8 +253,8 @@ class Conversation(object):
 
     def _spawn_checker(self, conn, conn_addr, socket_addr):
         """ spawn a checker thread """
+        self.logger.debug('checker start from "%s"' % socket_addr)
         _add_thread(self._check, args=(conn, conn_addr, socket_addr))
-        self.logger.info('checker start from "%s"' % socket_addr)
         return True
 
     def _check(self, conn, conn_addr, socket_addr):
@@ -261,6 +275,7 @@ class Conversation(object):
         # check a message
         reply = self.listeners[socket_addr].check_fn(message)
         # reply message
+        self.logger.debug('reply message "%s"' % reply)
         conn.send(reply)
         conn.close()
 
@@ -302,7 +317,7 @@ class Conversation(object):
         else:
             if not work_fn:
                 work_fn = self.work_fn
-            for name in self.workers:
+            for name in self.workers.keys():
                 if name == worker_name:
                     self.logger.warn('"%s" worker already exists'
                                      % worker_name)
@@ -322,6 +337,13 @@ class Conversation(object):
             except KeyError:
                 self.logger.warn('cannot find the "%s" worker' % worker_name)
                 return False
+
+    def get_worker_list(self):
+        list = []
+        for worker in self.workers.keys():
+            list.append('%s %s' % (worker, self.workers[worker].status))
+        self.logger.debug('get worker list')
+        return ('%s' % '\n'.join(list))
 
     def _work(self, worker_name, worker_fn):
         """ dequeue from a queue and work """
@@ -370,15 +392,13 @@ class TalkError(Exception):
 class TalkQueue:
     """ queue definition """
 
-    def __init__(self, queue_name, worker=None):
+    def __init__(self, queue_name):
         self.name = queue_name
         self.condition = threading.Condition()
         self.items = []
         self.idents = []
         self.worker = []
         self.status = 'Empty'
-        if worker:
-            worker.append(worker)
 
     def put_item(self, ident, item):
         """ put a item to the queue """
