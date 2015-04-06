@@ -4,63 +4,91 @@
 import os
 import sys
 import time
+import subprocess
+import signal
 from signal import SIGTERM
+from daemon import DaemonContext
+from lockfile.pidlockfile import PIDLockFile
+from getopt import getopt, GetoptError
+from socket import gethostname, gethostbyname
 
 try:
-    import psutil
-    from daemon import DaemonContext
-    from lockfile.pidlockfile import PIDLockFile
-    from socketalk import StoreTalk, TalkError
+    from socketalk import StoreTalks, TalkError
 except ImportError, detail:
     sys.exit('ImportError: %s' % detail)
 
 
-class SocketListen(StoreTalk):
-    """
-    daemonize listen process
-    """
-
-    def __init__(self, db_url='sqlite://', logfile='/dev/stdout'):
-        super(SocketListen, self).__init__(db_url, logfile)
-
-    def listen_daemon(self, pidfile):
-        """ deamone process start """
-        # check lockfile
-        lock = PIDLockFile(pidfile)
-        if lock.is_locked():
-            raise TalkError('%s already exists' % lock.lock_file)
-        # daemonize
-        self.status = 'Daemonize'
-        context = DaemonContext(pidfile=lock,
-                                files_preserve=[self.handler.stream])
-        with context:
-            self.listen()
-
-
-class ListenCommand:
+class ListenCommand(object):
     """
     start, stop, and show statu of the listen daemon
     """
 
+    option = 'dp:'
+    long_option = ['help', 'kill', 'log']
     pidfile = '/var/run/listend.pid'
     logfile = '/var/log/listend.log'
-    addr = '127.0.0.1:50010'
+    hosts = ['127.0.0.1']
+    port = 50010
     database = 'postgresql://kmm:postgres@localhost:5432/testdb'
 
-    def __init__(self):
-        pass
+    def __init__(self, argv):
+        self.name = argv[0]
+        self.argv = argv[1:]
+        self.is_daemon = False
+
+    def check_argv(self):
+        """ check argv """
+        # handle options
+        try:
+            (opt_list, other_args) = getopt(self.argv, self.option,
+                                            self.long_option)
+        except GetoptError, detail:
+            sys.exit('GetoptError: %s' % detail)
+        # check longoption
+        if len(opt_list) == 1:
+            if opt_list[0][0] == '--kill':
+                return 'kill'
+            elif opt_list[0][0] == '--log':
+                return 'log'
+        # check option
+        for (opt, arg) in opt_list:
+            if opt == '-p':
+                self.port = int(arg)
+            elif opt == '-d':
+                self.is_daemon = True
+            else:
+                return 'usage'
+        return 'run'
 
     def usage(self):
-        sys.stdout.write('Usage: listend [start|stop|status]\n')
+        """ print usage """
+        space = get_space(len(self.name))
+        sys.exit('Usage: %s [--help|--kill]\n'
+                 '       %s [-p port] [-d]' % (self.name, space))
 
-    def start(self):
+    def listen(self):
+        """ listen main """
+        self.hosts.append(gethostbyname(gethostname()))
+        talk = StoreTalks(db_url=self.database)
+        for host in self.hosts:
+            addr = '%s:%d' % (host, self.port)
+            talk.add_socket(addr)
+        try:
+            talk.listen()
+        except TalkError, detail:
+            sys.exit('Error: %s' % detail)
+
+    def run(self):
+        """ start process """
         if not os.getuid() == 0:
             sys.exit('Error: You must be root')
-        t = SocketListen(self.database, self.logfile)
-        t.add_socket(self.addr)
-        t.listen_daemon(pidfile=self.pidfile)
+        if self.is_daemon:
+            daemonize(self.listen, self.pidfile, self.logfile)
+        else:
+            self.listen()
 
-    def stop(self):
+    def kill(self):
+        """ stop daemon """
         if not os.getuid() == 0:
             sys.exit('Error: You must be root')
         pid = get_pid_from_file(self.pidfile)
@@ -71,42 +99,54 @@ class ListenCommand:
         while os.path.exists(self.pidfile):
             time.sleep(1)
 
-    def restart(self):
-        self.stop()
-        self.start()
+    def log(self):
+        cmd = ['/usr/bin/less', self.logfile]
+        pid = subprocess.Popen(cmd)
 
-    def status(self):
-        pid = get_pid_from_file(self.pidfile)
-        if pid in psutil.get_pid_list():
-            sys.stdout.write('Info: listend is running\n')
+        def send_signal(signum, frame):
+            pid.send_signal(signal.SIGINT)
+
+        signal.signal(signal.SIGINT, send_signal)
+        pid.communicate()
+
+    def main(self):
+        operate = self.check_argv()
+        if operate == 'run':
+            self.run()
+        elif operate == 'kill':
+            self.kill()
+        elif operate == 'log':
+            self.log()
         else:
-            sys.exit('Error: listend is not running')
+            self.usage()
 
-    def run(self):
-        if not os.getuid() == 0:
-            sys.exit('Error: You must be root')
-        t = SocketListen(self.database)
-        t.add_socket(self.addr)
-        t.listen()
+
+def daemonize(func, pidfile, logfile):
+    lock = PIDLockFile(pidfile)
+    if lock.is_locked():
+        sys.exit('cannot start daemon: %s already exists' % lock.lock_file)
+    context = DaemonContext(pidfile=lock,
+                            stdout=open(logfile, 'a'))
+    with context:
+        func()
+
+
+def get_space(num):
+    space = ''
+    for count in range(num):
+        space += ' '
+    return space
 
 
 def get_pid_from_file(pidfile):
+    """ get pid from pidfile """
     if os.path.exists(pidfile):
-        with open(pidfile, 'r') as f:
-            return int(f.read())
+        with open(pidfile, 'r') as file:
+            return int(file.read())
     else:
         sys.exit('Info: Worker is not running')
 
 
-if __name__ == "__main__":
-    l = ListenCommand()
-    if len(sys.argv) > 1:
-        operate = {'start': l.start,
-                   'stop': l.stop,
-                   'restart': l.restart,
-                   'status': l.status,
-                   'run': l.run}
-        if sys.argv[1] in operate.keys():
-            operate.get(sys.argv[1], l.usage)()
-    else:
-        l.usage()
+if __name__ == '__main__':
+    LISTEN = ListenCommand(sys.argv)
+    LISTEN.main()

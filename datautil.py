@@ -8,30 +8,21 @@ from sqlalchemy.ext.declarative import declarative_base
 Base = declarative_base()
 
 
-class SocketData(Base):
-    __tablename__ = 'socket'
-    id = Column(Integer, primary_key=True)
-    addr = Column(String)
-
-    def __init__(self, addr):
-        self.addr = addr
-
-    def __repr__(self):
-        return ('SocketData(%s)' % (self.addr))
-
-
 class MessageData(Base):
     __tablename__ = 'message'
     id = Column(Integer, primary_key=True)
     text = Column(String)
     origin = Column(String)
+    status = Column(String)
 
     def __init__(self, text, origin=None):
         self.text = text
         self.origin = origin
+        self.status = 'Init'
 
     def __repr__(self):
-        return ('WorkerData(%s, %s)' % (self.text, self.origin))
+        return('WorkerData(%d, %s, %s, %s)'
+               % (self.id, self.text, self.origin, self.status))
 
 
 class TalkDB:
@@ -41,18 +32,15 @@ class TalkDB:
         SessionMaker = sessionmaker(bind=self.engine)
         self.session = SessionMaker()
 
-    def add(self, data):
-        self.session.add(data)
+    def add(self, object):
+        self.session.add(object)
 
-    def delete(self, data):
-        self.session.delete(data)
+    def delete(self, object):
+        self.session.delete(object)
 
-    def get(self, data, key=None):
-        if key:
-            target = self.session.query(data).filter_by(key).first()
-        else:
-            target = self.session.query(data)
-        return target
+    def get(self, data):
+        objects = self.session.query(data).all()
+        return objects
 
     def commit(self):
         self.session.commit()
