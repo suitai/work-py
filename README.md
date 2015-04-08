@@ -1,14 +1,11 @@
 work-py
 =======
-An job manager for a workstation
+An socket server and client
 
 USAGE
 ===
-To start the daemon  
-```python workd.py start```
+To start the server daemon  
+```python solistend.py -d```
 
-To stop the daemon  
-```python workd.py stop```
-
-To run a job  
-```python workjob.py run <command>```
+To send message to message  
+```python sospeak.py hostname message```

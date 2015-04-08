@@ -1,12 +1,30 @@
 #!/usr/bin/env python
-""" command to speak to a socket"""
+""" command to speak to a socket """
 
 import sys
-from getopt import getopt, GetoptError
-try:
-    from socketalk import SocketTalk, TalkError, DEFAULT_PORT
-except ImportError, detail:
-    sys.exit('ImportError: %s' % detail)
+import socket
+import getopt
+
+DEFAULT_PORT = 50010
+BUFFER_SIZE = 1024
+
+
+def speak(message, host, port):
+    """ speak through a socket """
+    # send message
+    speak_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    speak_socket.settimeout(5)
+    try:
+        speak_socket.connect((host, port))
+        speak_socket.send(message)
+    except socket.error:
+        speak_socket.close()
+    except socket.timeout:
+        speak_socket.close()
+    else:
+        # accept message
+        message = speak_socket.recv(BUFFER_SIZE)  # bufsize
+        return message
 
 
 class SpeakCommand(object):
@@ -26,21 +44,21 @@ class SpeakCommand(object):
         """ check argv """
         # handle options
         try:
-            (opt_list, other_args) = getopt(self.argv, self.option,
-                                            self.long_option)
-        except GetoptError, detail:
+            (options, others) = getopt.getopt(self.argv, self.option,
+                                              self.long_option)
+        except getopt.GetoptError, detail:
             sys.exit('GetoptError: %s' % detail)
         # check option
-        for (opt, arg) in opt_list:
+        for (opt, arg) in options:
             if opt == '-p':
                 self.port = int(arg)
             else:
                 return 'usage'
         # check other args
-        if len(other_args) > 1:
-            self.host = other_args[0]
-            self.messages = other_args[1:]
-            return 'send'
+        if len(others) > 1:
+            self.host = others[0]
+            self.messages = others[1:]
+            return 'speak'
         else:
             return 'usage'
 
@@ -48,22 +66,20 @@ class SpeakCommand(object):
         """ print usage """
         sys.exit('Usage: %s [-p port] hostname message\n' % self.name)
 
-    def send(self):
+    def speak(self):
         """ send message """
         reply = ''
-        socket = '%s:%d' % (self.host, self.port)
         message = ' '.join(self.messages)
-        talk = SocketTalk(logfile='/dev/null')
         try:
-            reply = talk.speak(socket, message)
-        except TalkError, detail:
+            reply = speak(message, self.host, self.port)
+        except Exception, detail:
             sys.exit('Error: %s' % detail)
         sys.stdout.write('%s\n' % reply)
 
     def main(self):
         operate = self.check_argv()
-        if operate == 'send':
-            self.send()
+        if operate == 'speak':
+            self.speak()
         else:
             self.usage()
 
